@@ -17,7 +17,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/runtime';
 import { getWorld } from '../api/world';
 import { claim as claimRequest, claimByLocation as claimByLocationRequest } from '../api/territory';
-import { syncSteps as syncStepsRequest } from '../api/mana';
 import { me as fetchMe } from '../api/auth';
 import { ApiError } from '../api/errors';
 import type { ClaimByLocationRequest } from '../api/types';
@@ -120,25 +119,15 @@ export function useClaimByLocation() {
 }
 
 /**
- * Report walked steps.
+ * Note there is deliberately no `useSyncSteps` here.
  *
- * The delta must be steps since the last *successful* sync. A retried sync after
- * a timeout would otherwise credit the same walk twice, and a client that
- * sends a running total instead would credit it on every call.
+ * Reporting steps is not a plain mutation, because the delta must be steps since
+ * the last *successful* sync -- a retried request after a timeout would
+ * otherwise credit the same walk twice. That bookkeeping lives in
+ * `useStepTracker`, which owns the persisted ledger and is the only thing that
+ * may decide what a delta is. A second mutation that took a raw number would be
+ * a way to bypass the one rule that stops a walk being paid for twice.
  */
-export function useSyncSteps() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (stepsDelta: number) => syncStepsRequest(api, { steps_delta: stepsDelta }),
-    onSuccess: async () => {
-      // The sync response is complete mana state, but the session store's user
-      // is a different shape. Rather than duplicate the merge, let /me supply
-      // it -- the response told us the balance changed, and this is one request.
-      await queryClient.invalidateQueries({ queryKey: ['me'] });
-    },
-  });
-}
 
 /** The profile, refetched on the same cadence as the map. */
 export function useProfile() {

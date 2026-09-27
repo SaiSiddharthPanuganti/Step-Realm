@@ -15,6 +15,7 @@ import { login, me, signup } from '../src/api/auth';
 import { getWorld } from '../src/api/world';
 import { claim, claimByLocation } from '../src/api/territory';
 import { syncSteps } from '../src/api/mana';
+import { manaWorth } from '../src/steps/checkpoint';
 import { CONTRACT_BASE_URL } from './helpers/server';
 import {
   assertClaimResponse,
@@ -375,6 +376,43 @@ describe('mana', () => {
     const error = await syncSteps(client, { steps_delta: -5 }).catch((e: unknown) => e);
 
     expect((error as ApiError).status).toBe(422);
+  });
+
+  it('credits exactly what the client preview promises', async () => {
+    // The sync button renders "+N mana" computed by `manaWorth`, so if that
+    // function ever rounds differently from the server the UI makes a promise
+    // the server does not keep. Nothing else would catch it: the sync still
+    // succeeds, mana still changes, and the only symptom is a number on a
+    // button being wrong.
+    //
+    // A fresh account per case, deliberately. Only a *first* sync gets the
+    // 600-second grace, so a second sync on the same account is judged against
+    // elapsed time and would be rejected for reasons that have nothing to do
+    // with the arithmetic under test.
+    for (const steps of [0, 400, 999, 1_000, 1_500, 2_500]) {
+      const { client } = await signedInClient(`preview${steps}`);
+      const result = await syncSteps(client, { steps_delta: steps });
+
+      expect(result.walking_mana_gained).toBe(manaWorth(steps));
+    }
+  });
+
+  it('rejects a second sync however small, because the first set the clock', async () => {
+    // A consequence of the plausibility check that the client has to design
+    // around: eligibility is measured from the last *credited* sync, so once one
+    // has happened a follow-up a second later is capped at about five steps and
+    // anything larger is a 422. A client that retried a failed sync in a loop, or
+    // synced on a timer, would break its own sync button.
+    //
+    // Pinning this because it is invisible from the client: nothing in the
+    // response says "you are now rate limited by walking speed".
+    const { client } = await signedInClient('twice');
+
+    await syncSteps(client, { steps_delta: 1_000 });
+    const second = await syncSteps(client, { steps_delta: 800 }).catch((e: unknown) => e);
+
+    expect(second).toBeInstanceOf(ApiError);
+    expect((second as ApiError).status).toBe(422);
   });
 
   it('requires a token', async () => {

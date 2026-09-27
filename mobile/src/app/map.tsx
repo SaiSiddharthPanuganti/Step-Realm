@@ -12,7 +12,10 @@ import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-nati
 import { useRouter } from 'expo-router';
 
 import { useSession } from '../auth/session';
-import { useClaim, useProfile, useWorld, type Viewport } from '../state/world';
+import { useClaim, useClaimByLocation, useProfile, useWorld, type Viewport } from '../state/world';
+import { useStepTracker, type StepTrackerStatus } from '../steps/useStepTracker';
+import { usePlayerLocation } from '../location/usePlayerLocation';
+import { manaWorth } from '../steps/checkpoint';
 import { worldToLayers, type LonLat } from '../map/geojson';
 import { PlaceholderMap } from '../map/MapView';
 import { ApiError } from '../api/errors';
@@ -32,6 +35,9 @@ export default function MapScreen() {
   const world = useWorld(status === 'signed-in' ? viewport : null);
   const profile = useProfile();
   const claim = useClaim();
+  const claimHere = useClaimByLocation();
+  const steps = useStepTracker();
+  const place = usePlayerLocation();
 
   const layers = useMemo(
     () => (world.data ? worldToLayers(world.data) : null),
@@ -65,6 +71,39 @@ export default function MapScreen() {
     },
     [claim],
   );
+
+  const onClaimHere = useCallback(() => {
+    if (place.latitude === null || place.longitude === null) {
+      return;
+    }
+    setNotice(null);
+    claimHere.mutate(
+      { lat: place.latitude, lon: place.longitude },
+      {
+        onSuccess: (result) => {
+          setNotice(
+            result.tile.is_new
+              ? `Claimed the hex you are standing on for ${result.mana_spent} mana`
+              : 'You already own the hex you are standing on',
+          );
+        },
+        onError: (error: unknown) => {
+          setNotice(
+            error instanceof ApiError ? error.userMessage : 'Could not claim that hex',
+          );
+        },
+      },
+    );
+  }, [claimHere, place.latitude, place.longitude]);
+
+  const onSyncSteps = useCallback(() => {
+    setNotice(null);
+    void steps.sync().catch(() => {
+      // The tracker keeps the steps pending, and its own error is rendered
+      // below, so this only has to stop the rejection escaping as an unhandled
+      // promise.
+    });
+  }, [steps]);
 
   if (status === 'signed-out') {
     // The gate in `index` normally prevents this, but a session can end while
@@ -104,6 +143,21 @@ export default function MapScreen() {
           <Text style={styles.subtle}>Sign out</Text>
         </Pressable>
       </View>
+
+      <ActionBar
+        pendingSteps={steps.pendingSteps}
+        stepStatus={steps.status}
+        syncing={steps.syncing}
+        onSyncSteps={onSyncSteps}
+        mana={user?.mana ?? 0}
+        canClaimHere={place.ready}
+        claimingHere={claimHere.isPending}
+        locating={place.locating}
+        onLocate={() => void place.refresh()}
+        onClaimHere={onClaimHere}
+        locationMessage={place.message}
+        stepError={steps.error}
+      />
 
       {world.isPending ? (
         <View style={styles.centred}>
@@ -156,6 +210,116 @@ export default function MapScreen() {
 }
 
 /**
+ * The two things a player does between looking at the map: report the walk, and
+ * take the ground.
+ *
+ * The step count is shown next to the mana it is actually worth, not the mana it
+ * might be worth when rounded up. 1,500 steps is worth 0 mana on its own because
+ * the server carries the half block forward, and a button promising 20 that
+ * credits nothing is worse than one promising nothing.
+ */
+function ActionBar({
+  pendingSteps,
+  stepStatus,
+  syncing,
+  onSyncSteps,
+  mana,
+  canClaimHere,
+  claimingHere,
+  locating,
+  onLocate,
+  onClaimHere,
+  locationMessage,
+  stepError,
+}: {
+  pendingSteps: number;
+  stepStatus: StepTrackerStatus;
+  syncing: boolean;
+  onSyncSteps: () => void;
+  mana: number;
+  canClaimHere: boolean;
+  claimingHere: boolean;
+  locating: boolean;
+  onLocate: () => void;
+  onClaimHere: () => void;
+  locationMessage: string | null;
+  stepError: string | null;
+}) {
+  const worth = manaWorth(pendingSteps);
+  const hasSteps = pendingSteps > 0;
+
+  return (
+    <View style={styles.actionBar}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ disabled: !hasSteps || syncing }}
+        disabled={!hasSteps || syncing}
+        style={[styles.action, (!hasSteps || syncing) && styles.actionDisabled]}
+        onPress={onSyncSteps}
+      >
+        {syncing ? (
+          <ActivityIndicator color={colours.background} size="small" />
+        ) : (
+          <Text style={styles.actionLabel}>
+            {hasSteps
+              ? `Report ${pendingSteps} steps · +${worth} mana`
+              : stepLabel(stepStatus)}
+          </Text>
+        )}
+      </Pressable>
+
+      {canClaimHere ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ disabled: claimingHere }}
+          disabled={claimingHere}
+          style={[styles.action, claimingHere && styles.actionDisabled]}
+          onPress={onClaimHere}
+        >
+          {claimingHere ? (
+            <ActivityIndicator color={colours.background} size="small" />
+          ) : (
+            <Text style={styles.actionLabel}>Claim this hex · {mana} mana</Text>
+          )}
+        </Pressable>
+      ) : (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ disabled: locating }}
+          disabled={locating}
+          style={[styles.action, styles.actionSecondary, locating && styles.actionDisabled]}
+          onPress={onLocate}
+        >
+          {locating ? (
+            <ActivityIndicator color={colours.accent} size="small" />
+          ) : (
+            <Text style={styles.actionLabelSecondary}>
+              {locationMessage ?? 'Find me to claim this hex'}
+            </Text>
+          )}
+        </Pressable>
+      )}
+
+      {stepError !== null ? <Text style={styles.actionError}>{stepError}</Text> : null}
+    </View>
+  );
+}
+
+/** Why there are no steps to report, which is usually not a fault. */
+function stepLabel(status: StepTrackerStatus): string {
+  switch (status) {
+    case 'loading':
+      return 'Reading your step history…';
+    case 'unavailable':
+      return 'No step sensor on this device';
+    case 'denied':
+      return 'Step counting is turned off';
+    default:
+      return 'Walk to earn mana';
+  }
+}
+
+/**
  * Mana as a bar, not a number.
  *
  * A number alone cannot answer the only question a player has while walking:
@@ -189,6 +353,36 @@ const styles = StyleSheet.create({
   headerText: { flex: 1 },
   name: { ...type.heading, color: colours.text },
   subtle: { ...type.caption, color: colours.textMuted },
+  actionBar: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: space.sm,
+    paddingHorizontal: space.lg,
+    paddingBottom: space.md,
+  },
+  actionError: {
+    ...type.caption,
+    color: colours.danger,
+    width: '100%',
+  },
+  action: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colours.accent,
+    borderRadius: radius.md,
+    paddingHorizontal: space.md,
+    paddingVertical: space.md,
+    minHeight: 44,
+  },
+  actionSecondary: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: colours.border,
+  },
+  actionDisabled: { opacity: 0.45 },
+  actionLabel: { ...type.bodyStrong, color: colours.background, textAlign: 'center' },
+  actionLabelSecondary: { ...type.caption, color: colours.textMuted, textAlign: 'center' },
   mana: { alignItems: 'center', gap: space.xs, width: 92 },
   manaTrack: {
     width: '100%',
