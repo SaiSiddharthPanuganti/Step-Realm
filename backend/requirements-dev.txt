@@ -1,0 +1,14 @@
+# Development and test dependencies. Not installed in production.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# NOTE: if pip stalls on "pypi.ngc.nvidia.com", your global pip config has a
+# stale NVIDIA PyIndex in extra-index-url. Work around it per-command with
+#   $env:PIP_EXTRA_INDEX_URL=""
+# rather than editing the global config.
+
+-r requirements.txt
+
+pytest==9.1.1
+pytest-cov==7.1.0
+httpx==0.28.1

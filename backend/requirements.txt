@@ -1,0 +1,30 @@
+# StepRealm backend dependencies.
+#
+# Exact pins, generated from a verified install on Python 3.14 (win_amd64).
+# Re-resolve with:  pip install -U -r requirements.txt
+#
+# Sync SQLAlchemy + psycopg (not asyncpg / async SQLAlchemy). Reasons:
+#   * psycopg ships reliable cp314 wheels; asyncpg does not reliably.
+#   * The concurrency guarantee in app/services/territory_service.py is built
+#     on SELECT ... FOR UPDATE. Expressing and *testing* that with threads
+#     against a blocking driver is far more direct than the async
+#     equivalent, where the interleaving points are easy to get wrong and a
+#     passing test can still be a false negative.
+
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+sqlalchemy==2.1.1
+alembic==1.20.0
+psycopg[binary]==3.3.6
+
+pyjwt==2.15.0
+bcrypt==5.0.0
+# Backs pydantic's EmailStr. Real syntax and domain validation rather than a
+# hand-rolled regex, which is the classic source of "valid-looking addresses
+# the mail system rejects" bugs.
+email-validator==2.3.0
+
+redis==8.1.0

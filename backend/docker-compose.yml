@@ -1,0 +1,43 @@
+# Free local development datastores. Nothing here is used in production;
+# Railway supplies managed Postgres and Redis in phase 9.
+#
+#   docker compose up -d
+#   docker compose ps
+#   docker compose down -v      # nuke, including data
+#
+# Tests run against a *separate* database so truncation can never touch dev
+# data. Create it once with:
+#   docker exec -it steprealm-postgres createdb -U postgres steprealm_test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: steprealm-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: steprealm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d steprealm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: steprealm-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:

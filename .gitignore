@@ -1,0 +1,46 @@
+# --- secrets ---------------------------------------------------------------
+# .env holds a real generated JWT_SECRET. Never commit it.
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- alembic ---------------------------------------------------------------
+# Migrations are source and must be committed; local artefacts are not.
+alembic/versions/__pycache__/
+
+# --- mobile (phases 10+) ---------------------------------------------------
+node_modules/
+.expo/
+dist/
+web-build/
+*.orig.*
+android/.gradle/
+android/app/build/
+android/local.properties
+ios/Pods/
+*.jks
+*.keystore
+
+# --- editors / os ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
