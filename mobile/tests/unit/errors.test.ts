@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { ApiError, describeErrorBody, parseRetryAfter } from '../../src/api/errors';
-import { apiErrorFromResponse } from '../../src/api/errors';
+import {
+  ApiError,
+  apiErrorFromResponse,
+  describeErrorBody,
+  parseRetryAfter,
+} from '../../src/api/errors';
 
 describe('parseRetryAfter', () => {
   it('reads a delay in seconds', () => {
