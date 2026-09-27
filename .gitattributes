@@ -1,0 +1,39 @@
+# Normalise line endings so the same file does not differ between a Windows and
+# a Linux checkout. Without this, every file shows as modified on the machine
+# that did not write it, which trains people to ignore `git status` -- at which
+# point it stops catching the one real change in the noise.
+#
+# `text=auto eol=lf` means: normalise to LF on commit, check out with the
+# platform's convention. Text files end up LF in the repository on every
+# machine, which is what diffs and CI assume.
+
+* text=auto eol=lf
+
+# Windows scripts are the exception. A CRLF-only batch file breaks on a
+# non-Windows runner, so they are deliberately kept CRLF in the working tree.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary. Never diff these, never touch their bytes.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.a binary
+*.aar binary
+*.jar binary
+*.keystore binary
+*.jks binary
+*.olm binary
+
+# Lockfiles are generated and must never be merged by hand.
+package-lock.json -diff
+yarn.lock -diff
+pnpm-lock.yaml -diff
