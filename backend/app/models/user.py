@@ -1,7 +1,7 @@
 """``users`` table.
 
 The mobile client is untrusted on every write path, so every column here is
-server-owned: the client sends *intents* (``/mana/sync`` step deltas,
+server-owned: the client sends *intents* (``/territory/walk`` distances,
 ``/territory/claim`` coordinates) and this table is the only place game state
 is decided.
 """
@@ -28,6 +28,7 @@ from app.core.constants import DISPLAY_NAME_MAX_LENGTH
 if TYPE_CHECKING:
     from app.models.college import College
     from app.models.hex_tile import HexTile
+    from app.models.walk_progress import WalkProgress
 
 
 class User(Base):
@@ -86,54 +87,30 @@ class User(Base):
     """Instant at which daily_mana_earned returns to zero. Advanced on every
     user load; if it is in the past the counters are zeroed first."""
 
-    pending_step_remainder: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
-    """Steps walked (0..STEPS_PER_MANA_BLOCK-1) that have not yet made a
-    whole mana block.
-
-    Added in migration 0002 and not in the spec's original data model. Without
-    it, a player who walks 1,500 steps would get 20 mana and silently lose the
-    other 500, and would lose up to 19 mana on every single sync. Carrying the
-    fraction forward is the only faithful reading of "1,000 steps = 20 mana"."""
-
-    # -- step anti-cheat (phase 6) ------------------------------------------
+    # -- walk-distance anti-cheat (phase 8) ---------------------------------
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
     """Server-side account creation time.
 
-    Added in migration 0005 purely to give the walking-speed cap a baseline for
-    a player who has never synced steps. A client cannot influence it, which is
-    the whole point -- see :data:`last_step_sync_at`."""
+    Added in migration 0005 purely to give the walking plausibility check a
+    baseline for a player who has never reported a walk. A client cannot
+    influence it, which is the whole point -- see :data:`last_walk_report_at`."""
 
-    last_step_sync_at: Mapped[datetime | None] = mapped_column(
+    last_walk_report_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    """When steps were last *credited* to this player, used by
-    :func:`app.services.mana_service.check_step_plausibility`.
+    """When the player's walk distance was last credited, used to check that a
+    reported distance could plausibly have been walked in the meantime.
 
-    NULL means "no steps have ever been credited", which is *not* an unlimited
-    allowance -- that would hand every new account a free maximum-size sync and
-    with it a full mana bar. NULL is measured from ``created_at`` instead.
+    NULL means "never reported" and is measured from ``created_at`` rather than
+    treated as unlimited, and the baseline advances only on accepted reports,
+    so a rejected one cannot shrink the next allowance.
 
-    Deliberately advanced only when steps are actually credited. Two reasons, and
-    the second is the important one:
-
-    * A rejected sync must not move it, or a client could probe the allowance
-      downward until it is zero and lock itself out, and a real player who
-      tripped the cap once could never sync again.
-    * A zero-step sync must not move it either. Foregrounding the app does not
-      walk, and if a 0-step refresh reset the baseline then a player who opens
-      the app every few minutes would find their next genuine sync measured
-      against a two-second window and rejected.
-
-    A consequence worth stating: a player can hold the baseline *older* than it
-    needs to be by never syncing, and the allowance keeps growing. That is
-    correct -- it is exactly the offline-walk case the allowance is sized for --
-    and the daily mana cap is what bounds what the extra distance is worth.
-    """
-
+    Anti-cheat here is deliberately the same budget as the metres a phone
+    reports: minuscule against a cheater who reports a spoofed GPS, but the
+    number the claim gate reads is one the server itself wrote, which is the
+    whole point of the ledger."""
     # -- college (optional, phase 7) --------------------------------------
     college_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -152,6 +129,10 @@ class User(Base):
 
     tiles: Mapped[list["HexTile"]] = relationship(
         "HexTile", back_populates="owner", lazy="select"
+    )
+
+    walk_progress: Mapped[list["WalkProgress"]] = relationship(
+        "WalkProgress", back_populates="user", lazy="select"
     )
 
     __table_args__ = (

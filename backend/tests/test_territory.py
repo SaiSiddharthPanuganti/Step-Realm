@@ -373,9 +373,10 @@ def test_all_six_neighbours_are_accepted(client, authed, offset) -> None:
     """
     dq, dr = offset
     headers, _ = player(authed, f"n{dq}_{dr}@example.com", 200)
+    headers2, _ = player(authed, f"n{dq}_{dr}b@example.com", 200)
 
     assert claim(client, headers, 0, 0).status_code == 200
-    assert claim(client, authed(), dq, dr).status_code == 200
+    assert claim(client, headers2, dq, dr).status_code == 200
 
 
 def test_adjacency_is_transitive(client, authed) -> None:

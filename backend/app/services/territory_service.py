@@ -11,10 +11,11 @@ The design follows from one rule: **lock in a fixed order, and let the
 database decide the rest.**
 
 * The user row is locked first, via the same
-  :func:`app.services.mana_service.load_user_for_update` that ``/mana/sync`` and
-  ``GET /me`` already use. Reusing it is not tidiness -- it means the mana read
-  here is serialised against every other path that can change a balance, and
-  that the stale instance handed over by ``get_current_user`` is discarded.
+  :func:`app.services.mana_service.load_user_for_update` that ``POST
+  /territory/walk`` and ``GET /me`` already use. Reusing it is not tidiness --
+  it means the mana read here is serialised against every other path that can
+  change a balance, and that the stale instance handed over by
+  ``get_current_user`` is discarded.
 * The tile row is locked second. User-then-tile is the order every claim takes,
   so two claims can block each other but can never deadlock.
 * Whether a hex is free is decided by the unique constraint on ``(q, r)``, not
@@ -40,7 +41,7 @@ from app.core.constants import (
     TILE_CLAIM_COST,
 )
 from app.models.hex_tile import HexTile
-from app.services import mana_service
+from app.services import mana_service, walk_service
 from app.services.geo import (
     axial_to_lonlat,
     axial_to_world,
@@ -92,6 +93,32 @@ class NotAdjacentToTerritory(Exception):
 
 class OutsideWorldLeash(Exception):
     """The hex is beyond the configured radius from the world origin."""
+
+
+class NotWalkable(Exception):
+    """The hex is free but does not sit on walkable ground.
+
+    Raised by the API layer, not by this service: deciding it needs a live
+    Overpass fetch, which must not happen inside the claim's transaction while
+    rows are locked. The gate runs before ``claim_tile`` starts, and it is the
+    display contract's mirror -- a hex that is not drawn is not claimable.
+    """
+
+
+class NotEnoughWalkProgress(Exception):
+    """The hex is free and the player can afford it, but has not walked far
+    enough inside it yet.
+
+    Carries the numbers so the API can tell the player how close they are
+    rather than just refusing -- the same shape as ``InsufficientMana``.
+    """
+
+    def __init__(self, walked: float, required: float) -> None:
+        super().__init__(
+            f"need {required:.1f} m walked inside this hex; you have {walked:.1f} m"
+        )
+        self.walked = walked
+        self.required = required
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +278,10 @@ def claim_tile(
     """
     # 1. Lock the user, first and always in this order. settle_mana here is
     #    what makes the claim affordable off regen alone, and what rolls the
-    #    daily reset if the player is claiming after UTC midnight.
+    #    daily reset if the player is claiming after UTC midnight. No walk
+    #    metres are attached: claim is a read of the balance, never a reward.
     user = mana_service.load_user_for_update(session, user_id)
-    mana_outcome = mana_service.settle_mana(user, steps=0, now=now)
+    mana_outcome = mana_service.settle_mana(user, walk_meters=0.0, now=now)
     regen = mana_outcome.passive_gained
 
     # 2. Lock (or create) the tile.
@@ -297,9 +325,24 @@ def claim_tile(
             session.rollback()
             raise NotAdjacentToTerritory
 
+        # The claim-distance gate: a tile is only claimable once the player has
+        # covered config.min_claim_distance_meters *inside* it. The metres are
+        # the server-owned ledger from POST /territory/walk (walk_service), never
+        # a client assertion. A required value of 0 disables the rule.
+        required = get_settings().min_claim_distance_meters
+        if required > 0:
+            walked = walk_service.progress_meters(session, user_id, q, r)
+            if walked < required:
+                session.rollback()
+                raise NotEnoughWalkProgress(walked, required)
+
         check_world_leash(q, r)
 
         tile.owner_id = user_id
+        # A claim spends the metres that made it possible: progress is deleted
+        # with the same transaction that writes the ownership, so the ledger
+        # cannot outlive the tile it earned.
+        walk_service.clear_progress(session, user_id, q, r)
         user.mana -= TILE_CLAIM_COST
         mana_spent = TILE_CLAIM_COST
         is_new = True

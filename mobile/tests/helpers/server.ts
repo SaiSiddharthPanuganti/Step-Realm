@@ -85,7 +85,7 @@ function resetDatabase(): void {
       'psql', '-U', 'postgres', '-d', 'steprealm_test',
       '-v', 'ON_ERROR_STOP=1',
       '-c',
-      'TRUNCATE users, hex_tiles, colleges, rate_limit_counters RESTART IDENTITY CASCADE;',
+      'TRUNCATE users, hex_tiles, colleges, rate_limit_counters, walk_progress RESTART IDENTITY CASCADE;',
     ],
     { encoding: 'utf8' },
   );
@@ -118,6 +118,30 @@ export async function setup(): Promise<void> {
       env: {
         ...process.env,
         DATABASE_URL: TEST_DATABASE_URL,
+        // Walkability talks to a third-party public API (Overpass) whose
+        // latency and availability are not this suite's business. The client↔
+        // server wire contract is what is being pinned down here, and the
+        // walkability behaviour itself has its own stubbed tests in the
+        // backend's pytest suite -- so a dropped Overpass connection must not
+        // be able to fail or slow a wire-format test. The field the feature
+        // adds is still asserted by shape.ts, because the schema sends it
+        // regardless of whether filtering is enabled.
+        WALKABILITY_ENABLED: 'false',
+        // Redis is disabled on purpose. The contract server reads dotenv too,
+        // so leaving REDIS_URL unset would quietly inherit backend/.env and
+        // point it at the *dev* database's cache -- shared state that would
+        // make leaderboard assertions depend on what the running dev server
+        // has written. An empty value (which the settings layer reads as
+        // "not configured") forces the deterministic Postgres fallback; the
+        // Redis behaviour itself is covered by pytest against its own test
+        // database.
+        REDIS_URL: '',
+        // The claim-distance gate is a behaviour with its own tests; here it
+        // would demand every claim spend a fake walk first. Pinning it to 0
+        // keeps the wire-format suite about the wire format, and the field the
+        // feature adds is still asserted by shape.ts, because the schema sends
+        // it regardless of whether the gate is active.
+        MIN_CLAIM_DISTANCE_METERS: '0',
         // Raised to the maximum the backend allows, because a limiter with a
         // low ceiling makes these tests fail for reasons that have nothing to
         // do with the client -- a suite that is rate limited looks exactly like

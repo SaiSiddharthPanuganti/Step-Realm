@@ -43,34 +43,9 @@ export interface TokenResponse {
   user: User;
 }
 
-// --- mana -------------------------------------------------------------------
-
-export interface ManaSyncRequest {
-  /**
-   * Steps walked *since the last successful sync*, never a running total.
-   *
-   * The distinction is not cosmetic. A client that resends an absolute count
-   * gets credited for the same walk on every sync, and the daily mana cap is
-   * the only thing standing between that and an economy-breaking client.
-   */
-  steps_delta: number;
-}
-
-export interface ManaSyncResponse {
-  mana: number;
-  mana_max: number;
-  passive_mana_gained: number;
-  walking_mana_gained: number;
-  total_mana_gained: number;
-  steps_credited: number;
-  /** Steps banked toward the next whole block. Display only; do not trust locally. */
-  pending_step_remainder: number;
-  daily_mana_earned: number;
-  daily_mana_remaining: number;
-  daily_reset_at: string;
-  /** Non-zero here is the explanation a player needs for a disappointing walk. */
-  mana_forfeited_to_daily_cap: number;
-  mana_forfeited_to_mana_max: number;
+/** The one, enforced way to pick a player-facing display name. */
+export interface DisplayNameUpdate {
+  display_name: string;
 }
 
 // --- territory --------------------------------------------------------------
@@ -103,6 +78,42 @@ export interface ClaimByLocationRequest {
   lon: number;
 }
 
+export interface WalkReportRequest {
+  lat: number;
+  lon: number;
+  /**
+   * Metres walked *since the last successful report in this hex*, never a
+   * running total. Same rule as steps: a client that resends an absolute count
+   * gets credited for the same walk on every report.
+   */
+  meters: number;
+}
+
+export interface WalkReportResponse {
+  /** The hex the server attributed the reported metres to. */
+  q: number;
+  r: number;
+  /** Total metres banked inside that hex, including this report. */
+  total: number;
+  /** From the server, so the HUD cannot drift from the gate that enforces it. */
+  required: number;
+  /** 0 when the hex is claimable. Negative only if a hex became claimable elsewhere. */
+  remaining: number;
+  /** The account balance and cap after this report, if the client ever shows them. */
+  mana: number;
+  mana_max: number;
+  /** Mana this report earned, which is its walking distance in whole metres. */
+  walking_gained: number;
+  /** Passive regen the report surfaced while refreshing the balance. */
+  passive_gained: number;
+  /** `walking_gained + passive_gained`; what the player actually gained. */
+  total_mana_gained: number;
+  /** The player's cumulative earnings so far today, against the daily cap. */
+  daily_mana_earned: number;
+  /** What is left of the daily cap before it stops paying out. */
+  daily_mana_remaining: number;
+}
+
 // --- world ------------------------------------------------------------------
 
 export interface TileOwner {
@@ -127,6 +138,12 @@ export interface WorldTile {
   lon: number;
   /** null means unclaimed, which is the overwhelmingly common case. */
   owner: TileOwner | null;
+  /**
+   * Metres this viewer has banked inside this hex, or 0 for an anonymous
+   * caller. Per-viewer on purpose, so a map shown to someone else cannot be
+   * used to read another player's position history.
+   */
+  walk_meters: number;
 }
 
 export interface WorldCentre {
@@ -158,6 +175,12 @@ export interface WorldResponse {
   /** The authenticated caller, or null. Compare against `tile.owner.id`. */
   viewer_id: number | null;
   /**
+   * True when the backend could not reach OpenStreetMap and fell back to
+   * showing everything unclaimed-able. Walkable-only boards arrive after a
+   * retry; the map can hint that instead of silently changing underfoot.
+   */
+  walkability_degraded: boolean;
+  /**
    * True when the requested latitude exceeded the Web Mercator limit and the
    * centre was pulled back. Surfaced rather than hidden so the client can say
    * "this is as close as the projection gets" instead of silently lying.
@@ -165,6 +188,53 @@ export interface WorldResponse {
   latitude_was_clamped: boolean;
   bounds: WorldBounds;
   tiles: WorldTile[];
+  /**
+   * The metres a player must bank inside a hex before claiming it, from the
+   * server's settings so the HUD cannot disagree with the gate that enforces
+   * it. Zero on servers where walk-distance claiming is switched off.
+   */
+  claim_required_meters: number;
+}
+
+// --- leaderboard ------------------------------------------------------------
+
+/**
+ * One ranked player. `rank` is competition-style: players with the same
+ * territory count share a rank, and the next distinct score skips the gap
+ * (1, 2, 2, 4).
+ */
+export interface LeaderboardEntry {
+  rank: number;
+  user_id: number;
+  display_name: string;
+  mana: number;
+  owned_tile_count: number;
+}
+
+/**
+ * The signed-in caller's own standing, always included so a player who has
+ * not cracked the top of the page still sees where they are. `rank` is None
+ * while they own nothing ("unranked" rather than "last").
+ */
+export interface LeaderboardViewer {
+  user_id: number;
+  display_name: string;
+  mana: number;
+  owned_tile_count: number;
+  rank: number | null;
+}
+
+export interface LeaderboardResponse {
+  /** Echoes the `limit` the caller asked for. */
+  limit: number;
+  /**
+   * True when the server served the board straight from Postgres because
+   * Redis could not help. The ranking is identical either way; the flag only
+   * exists so the UI can choose to label it a snapshot.
+   */
+  degraded: boolean;
+  entries: LeaderboardEntry[];
+  viewer: LeaderboardViewer | null;
 }
 
 // --- errors -----------------------------------------------------------------

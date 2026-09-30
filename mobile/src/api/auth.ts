@@ -1,4 +1,4 @@
-/** Endpoints for signup, login and reading the current user. */
+/** Endpoints for signup, login, reading the current user, and renaming it. */
 
 import type { ApiClient } from './client';
 import type { TokenResponse, User } from './types';
@@ -34,4 +34,18 @@ export function login(client: ApiClient, input: SignupInput): Promise<TokenRespo
  */
 export function me(client: ApiClient, signal?: AbortSignal): Promise<User> {
   return client.request<User>('/me', { method: 'GET', signal });
+}
+
+/**
+ * Choose the display name shown on territory.
+ *
+ * This is the one write path for the public label. The server enforces the
+ * character set and the uniqueness rule; the response is the profile, so the
+ * caller can adopt it wholesale rather than reconciling a delta.
+ */
+export function updateDisplayName(
+  client: ApiClient,
+  displayName: string,
+): Promise<User> {
+  return client.patch<User>('/me/display-name', { display_name: displayName });
 }

@@ -1,15 +1,20 @@
-"""Concurrency: concurrent step syncs must not double-credit or lose steps.
+"""Concurrency: concurrent walk reports must not double-credit or lose mana.
 
 This is the mana-system equivalent of the phase-5 territory race, and the same
 reasoning applies: the arithmetic is correct in every sequential test and only
 wrong under contention.
 
 The failure mode is specific. Without the row lock in
-``mana_service.sync_mana``, all N threads read the same
-``pending_step_remainder`` and ``daily_mana_earned``, each computes one whole
-block from its own delta, and each writes ``mana = 20``. Last writer wins, so
-N concurrent 1,000-step syncs would credit 20 mana instead of 20*N. The
-``FOR UPDATE`` serialises them so each observes the previous commit.
+``walk_service.record_walk``, all N threads read the same ``mana`` and
+``daily_mana_earned``, each prices its own metres, and each writes
+``mana = 20``. Last writer wins, so N concurrent 20-metre reports would credit
+20 mana instead of 20*N. The ``FOR UPDATE`` serialises them so each observes
+the previous commit.
+
+Plausibility is stubbed out for these tests (``no_walk_speed_cap``): a
+report measured against a microseconds-old baseline is correctly refused, but
+that is a per-report rule with its own dedicated tests in
+test_walk_progress.py. These tests are about the accounting under contention.
 """
 
 from __future__ import annotations
@@ -17,95 +22,93 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from app.core.constants import (
-    DAILY_WALKING_MANA_CAP,
-    MANA_PER_STEP_BLOCK,
-    STEPS_PER_MANA_BLOCK,
-)
-from app.db.session import get_session_factory
-from app.services.mana_service import sync_mana
+import pytest
 
+from app.core.constants import DAILY_WALKING_MANA_CAP
+from app.db.session import get_session_factory
+from app.services import walk_service
 
 THREADS = 8
 
 
-def _concurrent_syncs(user_id: int, deltas: list[int]) -> list[BaseException]:
-    """Run simultaneous step syncs for one user. Returns any errors."""
-    barrier = threading.Barrier(len(deltas))
+@pytest.fixture
+def no_walk_speed_cap(monkeypatch) -> None:
+    """Make the plausibility check irrelevant: this test is not about speed."""
+    from app.services import walk_service as walk
+
+    monkeypatch.setattr(
+        walk,
+        "check_report_plausibility",
+        lambda user, meters, now=None: None,
+    )
+
+
+def _concurrent_walks(
+    user_id: int, metres: list[float]
+) -> list[BaseException]:
+    """Run simultaneous walk reports for one user. Returns any errors."""
+    barrier = threading.Barrier(len(metres))
     errors: list[BaseException] = []
     lock = threading.Lock()
 
-    def attempt(steps: int) -> None:
+    def attempt(meters: float) -> None:
         with get_session_factory()() as session:
             try:
                 barrier.wait(timeout=20)
-                sync_mana(session, user_id, steps)
+                walk_service.record_walk(
+                    session, user_id=user_id, lat=0.0, lon=0.0, meters=meters
+                )
             except BaseException as exc:  # noqa: BLE001 - recorded for assertion
                 with lock:
                     errors.append(exc)
 
-    with ThreadPoolExecutor(max_workers=len(deltas)) as pool:
-        list(pool.map(attempt, deltas))
+    with ThreadPoolExecutor(max_workers=len(metres)) as pool:
+        list(pool.map(attempt, metres))
 
     return errors
 
 
-def test_concurrent_full_block_syncs_credit_every_block(
-    make_user, user_state, no_step_speed_cap
+def test_concurrent_walks_credit_every_report(
+    make_user, user_state, no_walk_speed_cap
 ) -> None:
-    """8 simultaneous 1,000-step syncs must credit 8 blocks, not 1.
+    """8 simultaneous 20-metre reports must credit 160 mana, not 20.
 
-    Without the row lock every thread reads remainder 0 and writes
+    Without the row lock every thread reads ``mana = 0`` and writes
     ``mana = 20``; last writer wins and the player is shorted 140 mana.
     """
     user_id = make_user(mana=0)
 
-    errors = _concurrent_syncs(user_id, [STEPS_PER_MANA_BLOCK] * THREADS)
+    errors = _concurrent_walks(user_id, [20.0] * THREADS)
     assert not errors, errors
 
     state = user_state(user_id)
-    assert state["mana"] == THREADS * MANA_PER_STEP_BLOCK
-    assert state["daily_mana_earned"] == THREADS * MANA_PER_STEP_BLOCK
-    assert state["pending_step_remainder"] == 0
+    assert state["mana"] == THREADS * 20
+    assert state["daily_mana_earned"] == THREADS * 20
 
 
-def test_concurrent_partial_syncs_lose_no_steps(
-    make_user, user_state, no_step_speed_cap
-) -> None:
-    """Fragmentary deltas must sum exactly, remainder included."""
-    user_id = make_user(mana=0)
-    deltas = [500] * THREADS  # 8 x 500 = 4,000 steps = 4 blocks
-
-    errors = _concurrent_syncs(user_id, deltas)
-    assert not errors, errors
-
-    state = user_state(user_id)
-    assert state["mana"] == 4 * MANA_PER_STEP_BLOCK
-    assert state["pending_step_remainder"] == 0
-
-
-def test_concurrent_syncs_respect_the_daily_cap(
-    make_user, user_state, no_step_speed_cap
+def test_concurrent_walks_respect_the_daily_cap(
+    make_user, user_state, no_walk_speed_cap
 ) -> None:
     """Concurrency must not become a way around the daily limit.
 
-    20 threads x 1,000 steps is 400 mana of walking, but the cap allows 200.
-    Serialised, exactly 10 blocks are granted and 10 are forfeited; nothing
-    more.
+    The day is seeded 10 mana from the cap, and 8 concurrent 20-metre reports
+    want 160 more. Serialised, exactly the 10 mana of headroom are granted and
+    the rest is forfeited -- not one thread's whole claim.
     """
-    user_id = make_user(mana=0)
-    oversubscribed = THREADS * 3  # 24 syncs, well past the 10-block cap
+    user_id = make_user(mana=0, daily_mana_earned=DAILY_WALKING_MANA_CAP - 10)
 
-    errors = _concurrent_syncs(user_id, [STEPS_PER_MANA_BLOCK] * oversubscribed)
+    errors = _concurrent_walks(user_id, [20.0] * THREADS)
     assert not errors, errors
 
     state = user_state(user_id)
     assert state["daily_mana_earned"] == DAILY_WALKING_MANA_CAP
-    assert state["mana"] == DAILY_WALKING_MANA_CAP
+    # Only the headroom landed; the remaining 150 mana of reported walking
+    # vanished rather than leaking into a redeemed buffer.
+    assert state["mana"] == 10
 
 
-def test_concurrent_syncs_for_different_users_do_not_interfere(
-    make_user, user_state
+def test_concurrent_walks_for_different_users_do_not_interfere(
+    make_user, user_state, no_walk_speed_cap
 ) -> None:
     """The lock is per-row, so unrelated users must still proceed in parallel."""
     user_ids = [make_user(mana=0, email=f"racer{i}@example.com") for i in range(THREADS)]
@@ -118,7 +121,9 @@ def test_concurrent_syncs_for_different_users_do_not_interfere(
         with get_session_factory()() as session:
             try:
                 barrier.wait(timeout=20)
-                sync_mana(session, user_id, STEPS_PER_MANA_BLOCK)
+                walk_service.record_walk(
+                    session, user_id=user_id, lat=0.0, lon=0.0, meters=20.0
+                )
             except BaseException as exc:  # noqa: BLE001
                 with lock:
                     errors.append(exc)
@@ -128,7 +133,7 @@ def test_concurrent_syncs_for_different_users_do_not_interfere(
 
     assert not errors, errors
     for user_id in user_ids:
-        assert user_state(user_id)["mana"] == MANA_PER_STEP_BLOCK
+        assert user_state(user_id)["mana"] == 20
 
 
 def test_regen_is_not_granted_twice_under_concurrent_reads(make_user, user_state, age_user) -> None:

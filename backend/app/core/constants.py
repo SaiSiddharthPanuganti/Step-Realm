@@ -37,21 +37,20 @@ a user row, deliberately *not* via a background scheduler. Lazy computation
 is correct regardless of how long the service was down, needs no cron, and
 has no failure mode where a dead scheduler silently stops mana regen."""
 
-STEPS_PER_MANA_BLOCK: Final[int] = 1000
-MANA_PER_STEP_BLOCK: Final[int] = 20
-"""Walking reward: each complete block of 1000 steps grants 20 mana.
+MANA_PER_METER: Final[float] = 1.0
+"""Walking reward: each metre of validated GPS distance grants one mana.
 
-Blocks are *not* rounded away. A player who walks 1500 steps has a 1.5 block
-balance, and settling a sync credits floor(balance) * 20 while carrying the
-remainder forward. Discarding the fraction would silently destroy up to 19
-mana per sync for anyone who does not walk in exact 1000-step multiples,
-which is almost everybody.
+This is *the* active mana faucet. A hex needs ``TILE_CLAIM_COST`` mana to
+claim and ``TILE_CLAIM_MIN_METERS`` of walking to earn that claim, so at
+1 mana per metre the 20 m inside a hex are worth exactly one claim -- the
+first walk funds the first tile.
 
-The client submits raw step counts and is untrusted (see the anti-cheat note
-in app/services/mana_service.py), so step deltas must be validated for
-monotonicity server-side before being credited."""
+Metres are credited where they are validated: in
+:func:`app.services.walk_service.record_walk`, under the same user row lock
+and from the same server-written ledger the claim gate reads. The client
+never reports a mana figure; it reports a distance and the server prices it."""
 
-DAILY_WALKING_MANA_CAP: Final[int] = 200
+DAILY_WALKING_MANA_CAP: Final[int] = 2000
 """Maximum mana obtainable from walking within one day.
 
 Tracked by ``users.daily_mana_earned``, reset at ``DAILY_RESET_UTC_HOUR`` UTC
@@ -59,33 +58,19 @@ via ``users.daily_mana_reset_at``. Note this caps *walking* mana only --
 passive regeneration is not subject to it, though it is subject to
 ``MANA_MAX``.
 
-Blocks are indivisible: if the cap leaves 15 mana of headroom, a whole
-20-mana block does not fit and nothing is granted. The leftover headroom is
-forfeited rather than carried, so a player cannot accumulate a buffer across
-days and then spend it in one go."""
-
-MAX_STEPS_PER_SYNC: Final[int] = 250_000
-"""Sanity ceiling on the step delta a single ``POST /mana/sync`` may submit,
-roughly 190 km.
-
-This is input validation, not anti-cheat. It exists to catch a malfunctioning
-or malicious client sending an absurd value, and to fail loudly rather than
-quietly. It is explicitly *not* a defence against cheating: the spec scopes
-production anti-cheat out of the MVP, and a client that walks 10,000 steps can
-still simply claim it. The real economic bound is
-``DAILY_WALKING_MANA_CAP``, which caps how much any step count can ever be
-worth."""
+At 1 mana per metre this is two kilometres of walking, i.e. roughly 100 walks
+of the 20 m that earns one claim: a generous daily budget that still bounds
+how much any scripted walk can be worth."""
 
 
 TILE_CLAIM_COST: Final[int] = 20
 
-INITIAL_MANA: Final[int] = 20
-"""NOT SPECIFIED BY THE DESIGN DOC -- flagged for product review.
+INITIAL_MANA: Final[int] = 0
+"""Starting mana for a brand-new account.
 
-Chosen so a brand new player can claim the hex they are standing on during
-their first session, instead of being locked out of the core loop for the 40
-minutes it would take passive regen to cover one tile. Set to 0 for a
-stricter economy that forces the first walk to earn the first claim."""
+Zero on purpose: mana comes from walking, so the very first tile must be
+*earned* by walking 20 m inside it, exactly like every later tile. There is no
+free claim that bypasses the walk-to-earn loop."""
 
 # ---------------------------------------------------------------------------
 # Hex grid
@@ -295,22 +280,94 @@ claims a minute"), so a 429 is explainable to a human without a stopwatch."""
 # Step anti-cheat (phase 6)
 # ---------------------------------------------------------------------------
 
-MAX_STEPS_PER_SECOND: Final[float] = 5.0
-"""Walking speed ceiling used to sanity-check a step delta against elapsed time.
+# ---------------------------------------------------------------------------
+# Walk distance (claim gating)
+# ---------------------------------------------------------------------------
+# A tile is only claimable once the player has covered a minimum distance
+# *inside* it. Distance is measured by the phone's GPS and reported to the
+# server, which accumulates it per (user, hex). The rule and the caps below are
+# the canonical numbers; the one a product could tune per deployment
+# (``min_claim_distance_meters``) lives in config alongside the other
+# deployment knobs.
 
-This is the first thing in the codebase that treats a step count as *implausible*
-rather than merely *large*, and it exists because ``MAX_STEPS_PER_SYNC`` does not
-help: 250,000 steps is a legitimate single sync for a player who walked all
-afternoon offline, so the same number is fine once an hour and absurd ten times
-a minute. Only the ratio of steps to elapsed time separates those.
+TILE_CLAIM_MIN_METERS: Final[float] = 20.0
+"""Minimum metres a player must cover inside a hex before they may claim it.
 
-Five steps per second is about 18,000 steps an hour, or a 16 km walk -- far
-beyond a normal session, chosen so that a real player never brushes the limit
-and a script submitting a fixed large number every few seconds does. A step is
-counted by the phone, so real-world cadence is roughly 1.5-2.5 steps per second;
-the cap is set at more than double the top of that range on purpose. It is a
-speed limit, not a step budget: mana is bounded by ``DAILY_WALKING_MANA_CAP``
-regardless, and this exists to make a blatant cheat visibly fail rather than to
-be the thing that makes cheating impossible.
-"""
+The core of the "walk then claim" loop. A ``min_claim_distance_meters`` of 0
+(what tests and the contract harness pin) restores the old claim-on-entry
+behaviour, which is exactly how the whole claim suite stays testable without a
+GPS walk happening first."""
+
+MAX_WALK_REPORT_METERS: Final[float] = 100.0
+"""Ceiling on the metres accepted from a single ``POST /territory/walk``.
+
+Real reports are a few metres per second of walking, and the client submits at
+most one report per few seconds, so 100 m is far beyond anything a genuine
+sync produces while still refusing an outright absurd number. It is also the
+``le`` bound on the request schema, so the ceiling is visible in the OpenAPI
+contract rather than hidden in a service."""
+
+MAX_WALK_SPEED_METERS_PER_SECOND: Final[float] = 4.0
+"""Plausible walking speed, in projected metres per second.
+
+GPS distance accumulates as you walk, and a report's metres are checked against
+the time since the player's previous report times this ceiling -- the same
+shape as ``MAX_STEPS_PER_SECOND``. 4 m/s is a fast jog, comfortably above any
+real walk, and it is a speed limit, not a budget: nothing stops a player from
+reporting as often as they like, only from claiming a distance no walk could
+have covered."""
+
+MAX_WALK_PROGRESS_METERS: Final[float] = 1000.0
+"""Cap on accumulated metres in a single hex before it is claimed.
+
+A hex is 40 m across, so anything past a few hundred metres is either an
+endless loop or a script. Once claimed the row is deleted anyway; the cap just
+stops an unchecked ledger from growing without bound server-side."""
+
+
+# ---------------------------------------------------------------------------
+# Walkability (phase 7)
+# ---------------------------------------------------------------------------
+
+WALKABLE_HIGHWAY_TAGS: Final[frozenset[str]] = frozenset(
+    {
+        "footway",
+        "path",
+        "pedestrian",
+        "living_street",
+        "residential",
+        "service",
+        "unclassified",
+        "tertiary",
+        "secondary",
+        "primary",
+        "track",
+        "steps",
+    }
+)
+"""``highway`` values that count as walkable ground.
+
+Explicitly excludes ``motorway``, ``motorway_link``, ``trunk`` and
+``trunk_link``: you cannot legally walk most of those, and a hex over one
+should not render as claimable territory. The set is curated rather than a
+"everything except motorways" rule so that the judgement is reviewed in one
+place rather than scattered across regexes in the Overpass query and in the
+parser, which could drift apart."""
+
+WALKABLE_LEISURE_TAGS: Final[frozenset[str]] = frozenset({"park"})
+"""``leisure`` values whose *area* (not just its boundary road) is walkable.
+
+A park is the one everyday walkable polygon that has no highway running
+through it, so classifying only roads would leave entire park hexes empty even
+though a player can absolutely stand in them."""
+
+WALKABILITY_SAMPLE_SPACING_METERS: Final[float] = HEX_SIZE_METERS / 2.0
+"""Spacing at which walkable geometry is resampled before hex snapping.
+
+OpenStreetMap nodes on a long straight road can be hundreds of metres apart,
+and snapping only the nodes would mark a node-free stretch as non-walkable.
+Walking every ``HEX_SIZE_METERS / 2`` metres along each segment guarantees at
+least one sample lands inside every hex the segment passes through, because a
+hex is 40 m across and a straight line through it must come within 40 m of its
+centre."""
 

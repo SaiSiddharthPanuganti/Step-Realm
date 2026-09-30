@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from app.core.constants import TILE_CLAIM_COST
+from app.core.constants import MAX_WALK_REPORT_METERS, TILE_CLAIM_COST
 
 
 class ClaimRequest(BaseModel):
@@ -68,8 +68,8 @@ class ClaimResponse(BaseModel):
     """Result of a claim attempt.
 
     The full mana state is returned, not just the new balance, for the same
-    reason ``ManaSyncResponse`` does: the client replaces its local model with
-    server truth rather than tracking a delta and hoping.
+    reason ``WalkReportResponse`` does: the client replaces its local model
+    with server truth rather than tracking a delta and hoping.
     """
 
     tile: ClaimedTile
@@ -83,3 +83,62 @@ class ClaimResponse(BaseModel):
     claim_cost: int = TILE_CLAIM_COST
     """Served rather than hardcoded in the client, so the cost the player is
     shown cannot drift from the cost the server charges."""
+
+
+class WalkReportRequest(BaseModel):
+    """Report metres walked since the previous report.
+
+    ``lat``/``lon`` is the coordinate the distance window *started* at, not a
+    live position. The server projects it to a hex with the same
+    ``lonlat_to_axial`` every claim uses and credits the metres there, so the
+    client never has to reimplement cube rounding and cannot disagree with the
+    backend about which tile a stretch of walking happened in.
+    """
+
+    lat: float = Field(ge=-90.0, le=90.0)
+    lon: float = Field(ge=-180.0, le=180.0)
+    meters: float = Field(
+        gt=0,
+        le=MAX_WALK_REPORT_METERS,
+        description=(
+            "Metres covered since the previous report. Bounded above by "
+            "MAX_WALK_REPORT_METERS; larger values are refused server-side."
+        ),
+    )
+
+
+class WalkReportResponse(BaseModel):
+    """The state of the hex the report landed in, after crediting.
+
+    ``total`` is the server-owned accumulated metres and is what the claim gate
+    will actually read, so the client can render progress from it rather than
+    from its own arithmetic. ``required`` and ``remaining`` keep the "walk 20 m
+    in this hex" number where the server can change it without a client
+    release.
+
+    The mana fields carry the *full* balance state, the same way a claim does:
+    walking is now the only way to earn mana, so the walk report is the one
+    moment the client can safely bring its balance forward -- showing the mana
+    earned and where it landed beats the client guessing.
+    """
+
+    q: int
+    r: int
+    total: float
+    """Accumulated metres in this hex after this report was credited."""
+    required: float
+    """The distance needed before this hex can be claimed."""
+    remaining: float
+    """``max(0, required - total)``, so the UI can say "just X more metres"."""
+    mana: int
+    mana_max: int
+    walking_gained: int
+    """Mana earned from this report's metres."""
+    passive_gained: int
+    """Mana that passive regen accrued since the last settlement."""
+    total_mana_gained: int
+    """``walking_gained + passive_gained``, the change to the balance."""
+    daily_mana_earned: int
+    """Walking mana counted against ``DAILY_WALKING_MANA_CAP`` today."""
+    daily_mana_remaining: int
+    """``max(0, DAILY_WALKING_MANA_CAP - daily_mana_earned)``."""

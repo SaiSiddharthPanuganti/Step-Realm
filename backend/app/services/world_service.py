@@ -4,6 +4,13 @@ The plane is unbounded and tiles materialise lazily, so this service answers
 "which of these 817 coordinates already exist as rows, and who owns them".
 It does not create rows and does not decide anything -- that is phase 5.
 
+When a ``walkability_resolver`` is injected, the disc is additionally reduced
+to the walkable subset before any row lookup or bounding box is computed, so
+the response, its counts, and its bounds all describe only the hexes a player
+can actually traverse. The resolver is injected rather than imported so this
+module stays free of HTTP -- *what is walkable* is deliberately somebody
+else's problem.
+
 One deliberate efficiency choice: the lookup is a range scan on ``q`` and
 ``r`` followed by an exact hex-distance filter in Python, rather than an
 ``IN`` list of 817 tuples. The unique constraint ``uq_hex_tiles_q_r`` is a
@@ -15,6 +22,7 @@ btree on ``(q, r)``, so the scan is index-backed, and the overscan is only
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,6 +37,7 @@ from app.core.constants import (
 )
 from app.models.hex_tile import HexTile
 from app.models.user import User
+from app.services import walk_service
 from app.services.geo import (
     Axial,
     BoundingBox,
@@ -71,6 +80,24 @@ class ViewportOutsideLeash(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class Walkability:
+    """The decision a resolver made about a disc: filter, or degrade.
+
+    ``walkable=None`` with ``degraded=False`` is "no filtering happened" (the
+    feature is off); ``walkable=None`` with ``degraded=True`` is "filtering
+    was attempted but the data source failed, so the full plane is served and
+    the response flags it". A non-``None`` ``walkable`` is a real filter.
+    """
+    walkable: set[tuple[int, int]] | None
+    degraded: bool = False
+
+
+#: Turns an exact disc into :class:`Walkability`. Injected from the API layer,
+#: where Overpass and its failure mode are configured.
+WalkabilityResolver = Callable[[list[Axial]], Walkability]
+
+
+@dataclass(frozen=True, slots=True)
 class ViewportTile:
     q: int
     r: int
@@ -96,6 +123,10 @@ class ViewportTile:
     """Always set when ``owner_id`` is. Kept as two fields rather than a nested
     object so this stays a flat slots dataclass that the response can be built
     from without allocating an intermediate model per tile."""
+    walk_meters: float = 0.0
+    """How far the *viewer* has walked inside this hex. Zero for every other
+    player and for anonymous viewers -- nobody else's progress is this module's
+    business to expose."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +148,11 @@ class WorldViewport:
     centre had to be pulled back to it. Surfaced rather than hidden so a client
     that somehow reaches the dead zone can tell the difference between "this is
     where you are" and "this is as close as the projection gets"."""
+    walkability_degraded: bool = False
+    """True only when walkability was enabled but the data source could not be
+    reached, so the viewport was served unfiltered. The client can say "the
+    whole grid is showing because the walkability check is down" instead of
+    silently believing every open field is claimable ground."""
 
 
 def clamp_rings_to_leash(
@@ -214,6 +250,8 @@ def build_viewport(
     lon: float,
     rings: int,
     hex_size_meters: float = HEX_SIZE_METERS,
+    walkability_resolver: WalkabilityResolver | None = None,
+    viewer_id: int | None = None,
 ) -> WorldViewport:
     """The full ``GET /world`` answer for a centre coordinate and radius."""
     if tile_count_in_radius(rings) > WORLD_VIEWPORT_MAX_TILES:
@@ -231,7 +269,26 @@ def build_viewport(
     )
 
     coordinates = list(tiles_in_radius(centre_q, centre_r, rings))
+
+    # The resolver is handed the *post-clamp, exact* disc, so a viewport that
+    # the leash shrank is filtered on what the response actually covers.
+    walkability_degraded = False
+    if walkability_resolver is not None:
+        resolution = walkability_resolver(coordinates)
+        walkability_degraded = resolution.degraded
+        if resolution.walkable is not None:
+            coordinates = [c for c in coordinates if c in resolution.walkable]
+
     owners = load_owners(session, (centre_q, centre_r), coordinates, rings)
+
+    # The viewer's own walk progress across the same disc, when there is a
+    # viewer. Same range-scan shape as load_owners, so the extra cost is one
+    # index-backed query when the caller is authenticated and zero otherwise.
+    walk_progress = (
+        walk_service.progress_map(session, viewer_id, coordinates)
+        if viewer_id is not None
+        else {}
+    )
 
     built: list[ViewportTile] = []
     for q, r in coordinates:
@@ -251,6 +308,7 @@ def build_viewport(
                 lon=round(tile_lon, COORDINATE_PRECISION_DEGREES),
                 owner_id=owner[0] if owner else None,
                 owner_display_name=owner[1] if owner else None,
+                walk_meters=walk_progress.get((q, r), 0.0),
             )
         )
     tiles = tuple(built)
@@ -274,4 +332,5 @@ def build_viewport(
         bounds=tiles_bounding_box(coordinates, hex_size_meters),
         tiles=tiles,
         latitude_was_clamped=clamped,
+        walkability_degraded=walkability_degraded,
     )

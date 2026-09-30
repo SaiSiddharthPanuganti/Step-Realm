@@ -13,6 +13,7 @@ import { useSession } from '../auth/session';
 
 export default function Index() {
   const status = useSession((state) => state.status);
+  const needsDisplayName = useSession((state) => state.needsDisplayName);
 
   // The root layout already blocks rendering on 'restoring', so by the time this
   // runs the answer is known. The guard is here because a redirect is a render
@@ -22,5 +23,11 @@ export default function Index() {
     return null;
   }
 
-  return <Redirect href={status === 'signed-in' ? '/map' : '/sign-in'} />;
+  if (status !== 'signed-in') {
+    return <Redirect href="/sign-in" />;
+  }
+
+  // The naming gate sits between sign-in and the map: a new account is not
+  // allowed on the board until its public label is chosen.
+  return <Redirect href={needsDisplayName ? '/display-name' : '/map'} />;
 }

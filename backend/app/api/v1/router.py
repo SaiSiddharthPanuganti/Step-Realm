@@ -13,15 +13,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import auth, mana, me, territory, world
+from app.api.v1 import auth, leaderboard, me, territory, world
 
 router = APIRouter()
 
 router.include_router(auth.router)
-router.include_router(mana.router)
 router.include_router(me.router)
 router.include_router(world.router)
 router.include_router(territory.router)
+router.include_router(leaderboard.router)
 
 # Phase 7: college
-# Phase 8: leaderboard

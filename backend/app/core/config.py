@@ -11,6 +11,8 @@ from functools import lru_cache
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.constants import TILE_CLAIM_MIN_METERS
+
 #: Value that must never reach a real deployment. Rejected at startup by
 #: :meth:`Settings._reject_placeholder_secret` when not in development.
 _PLACEHOLDER_SECRET = "change-me-in-production"
@@ -105,11 +107,32 @@ class Settings(BaseSettings):
     #: deployment decision rather than a default.
     trust_forwarded_for: bool = False
 
-    # -- step anti-cheat ----------------------------------------------------
-    #: Ceiling on walking speed, in steps per second, used to reject step deltas
-    #: that no amount of real walking could have produced in the time since the
-    #: player's previous sync. See constants.MAX_STEPS_PER_SECOND.
-    max_steps_per_second: float = Field(default=5.0, gt=0, le=50)
+    # -- claim gating ---------------------------------------------------------
+    #: How far a player must walk inside a hex before they can claim it.
+    #: ``0`` disables the requirement (tests and the mobile contract harness
+    #: pin this to keep claim flows walk-free). Defaults to
+    #: constants.TILE_CLAIM_MIN_METERS; see that constant for why 20 is the
+    #: product decision. Deployment-tunable here because the "walk 20 m first"
+    #: rule is a rule a staging or demo deployment may want to relax.
+    min_claim_distance_meters: float = Field(
+        default=TILE_CLAIM_MIN_METERS, ge=0, le=1000
+    )
+
+    # -- walkability ---------------------------------------------------------
+    #: Whether hexes are restricted to walkable ground (roads and parks from
+    #: OpenStreetMap). OFF by default so a deployment without Outbound access
+    #: keeps the old fully-procedural plane; the map tiles /world with a live
+    #: walkability check flagged, and claims require the target hex to be in the
+    #: walkable set. Both degrade to the old behaviour when Overpass is down.
+    walkability_enabled: bool = False
+    walkability_overpass_url: str = "https://overpass-api.de/api/interpreter"
+    #: Overpass is a public service with a queue; a short timeout keeps a slow
+    #: answer from pinning a world load or, worse, a claim attempt.
+    walkability_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    #: The raw Overpass answer for a viewport is cached keyed on its bounding
+    #: box snapped to this grid, so screens near each other share one fetch.
+    walkability_cache_cell_degrees: float = Field(default=0.02, gt=0, le=1.0)
+    walkability_cache_ttl_seconds: float = Field(default=600.0, gt=0)
 
     @field_validator("jwt_secret")
     @classmethod

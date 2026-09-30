@@ -70,6 +70,15 @@ web-build/
 /mobile/android/
 /mobile/ios/
 
+# --- local dev artefacts ----------------------------------------------------
+# Metro bundler runtime files. Written by `npm run dev` / the launcher scripts;
+# they are process state and log output, not source.
+metro.log
+metro.log.err
+metro.pid
+# Agent session transcripts written to the repo root. Large and machine-local.
+session-ses_*.md
+
 # --- editors / os ----------------------------------------------------------
 .vscode/
 .idea/

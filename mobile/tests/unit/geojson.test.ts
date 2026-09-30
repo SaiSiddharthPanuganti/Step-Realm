@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  axialToLonLat,
+  axialToWorld,
+  bearingDegrees,
+  haversineMeters,
   hexRing,
+  hexRingAt,
   includePoint,
+  lonlatToAxial,
   lonLatToWorld,
   ownershipOf,
   tileCentre,
@@ -27,6 +33,7 @@ function tile(overrides: Partial<WorldTile> = {}): WorldTile {
     lat: CENTRE[1],
     lon: CENTRE[0],
     owner: null,
+    walk_meters: 0,
     ...overrides,
   };
 }
@@ -203,8 +210,10 @@ describe('worldToLayers', () => {
     tile_count: 3,
     owned_count: 1,
     hex_size_meters: SIZE,
+    claim_required_meters: 0,
     viewer_id: 7,
     latitude_was_clamped: false,
+    walkability_degraded: false,
     bounds: {
       min_lon: CENTRE[0] - 0.001,
       max_lon: CENTRE[0] + 0.001,
@@ -265,5 +274,117 @@ describe('includePoint', () => {
 describe('tileCentre', () => {
   it('returns lon before lat', () => {
     expect(tileCentre(tile())).toEqual([CENTRE[0], CENTRE[1]]);
+  });
+});
+
+describe('lonlatToAxial', () => {
+  it('maps the origin to the origin tile', () => {
+    expect(lonlatToAxial(0, 0, SIZE)).toEqual({ q: 0, r: 0 });
+  });
+
+  it('round-trips every tile centre back to its own tile', () => {
+    // The server labels a tile by projecting its centre with the same
+    // cube-rounding this function ports, so a centre must always land back on
+    // itself -- a hemisphere-correct, orientation-correct projection would
+    // still fail this exactly at the points where rounding is contested.
+    for (const [q, r] of [
+      [0, 0],
+      [3, -2],
+      [-7, 11],
+      [2, 9],
+      [-4, -3],
+    ] as Array<[number, number]>) {
+      const [lon, lat] = axialToLonLat(q, r, SIZE);
+      expect(lonlatToAxial(lon, lat, SIZE)).toEqual({ q, r });
+    }
+  });
+
+  it('walks a hex eastwards in agreeably-sized steps', () => {
+    // 2 * SIZE east of the origin is comfortably inside (0, 0)'s eastern
+    // neighbour. On this pointy-top basis the due-east neighbour of (0,0) is
+    // (1,0): its centre sits sqrt(3) * SIZE to the east and due north/south of
+    // the origin.
+    const [eastLon, eastLat] = worldToLonLat(2 * SIZE, 0);
+    expect(lonlatToAxial(eastLon, eastLat, SIZE)).toEqual({ q: 1, r: 0 });
+  });
+
+  it('clamps poles instead of diverging, like the server', () => {
+    const result = lonlatToAxial(0, 89, SIZE);
+    expect(Number.isInteger(result.q)).toBe(true);
+    expect(Number.isInteger(result.r)).toBe(true);
+  });
+});
+
+describe('haversineMeters', () => {
+  it('measures a degree of latitude as about 111 km', () => {
+    const metres = haversineMeters([0, 0], [0, 1]);
+    expect(metres).toBeCloseTo(111_195, -1);
+  });
+
+  it('is zero for identical points', () => {
+    expect(haversineMeters([10, 20], [10, 20])).toBe(0);
+  });
+
+  it('is symmetric, because the route is the same both ways', () => {
+    const a: LonLat = [77.5946, 12.9716];
+    const b: LonLat = [77.6, 12.98];
+    expect(haversineMeters(a, b)).toBeCloseTo(haversineMeters(b, a), 9);
+  });
+});
+
+describe('bearingDegrees', () => {
+  it('points the compass the four obvious ways', () => {
+    const here: LonLat = [0, 0];
+    expect(bearingDegrees(here, [0, 1])).toBeCloseTo(0, 6); // north
+    expect(bearingDegrees(here, [1, 0])).toBeCloseTo(90, 6); // east
+    expect(bearingDegrees(here, [0, -1])).toBeCloseTo(180, 6); // south
+    expect(bearingDegrees(here, [-1, 0])).toBeCloseTo(270, 6); // west
+  });
+
+  it('stays inside [0, 360)', () => {
+    for (const point of [[10, 10], [-10, -10], [77.6, 12.98]] as LonLat[]) {
+      const bearing = bearingDegrees([77.5946, 12.9716], point);
+      expect(bearing).toBeGreaterThanOrEqual(0);
+      expect(bearing).toBeLessThan(360);
+    }
+  });
+});
+
+describe('hexRingAt', () => {
+  it('draws the same ring the layer does, for an arbitrary hex', () => {
+    // The highlight under the player must not disagree with the polygons the
+    // ownership layers draw, because the two share tiles' geometry.
+    const [lon, lat] = axialToLonLat(3, -2, SIZE);
+    const ring = hexRingAt(3, -2, SIZE);
+    expect(ring).toHaveLength(7);
+    expect(ring[0]).toEqual(ring[6]);
+
+    const centre = lonLatToWorld(lon, lat);
+    const [cx, cy] = centre;
+    for (const point of ring.slice(0, 6)) {
+      const [x, y] = lonLatToWorld(point[0], point[1]);
+      expect(Math.hypot(x - cx, y - cy)).toBeCloseTo(SIZE, 3);
+    }
+  });
+
+  it('matches hexRing for a tile built on the same centre', () => {
+    // The two ring builders must agree whenever they are asked about the same
+    // ground: hexRing draws from a WorldTile's stored centre, hexRingAt from an
+    // axial coordinate projected to a centre. Give them the exact same plane
+    // centre (no degree round-trip on the way in), so the comparison is about
+    // the ring math alone.
+    const [x, y] = axialToWorld(3, -2, SIZE);
+    const [lon, lat] = worldToLonLat(x, y);
+    const asTile: WorldTile = {
+      q: 3,
+      r: -2,
+      world_x: x,
+      world_y: y,
+      lat,
+      lon,
+      owner: null,
+      walk_meters: 0,
+    };
+    expect(hexRingAt(3, -2, SIZE)).toEqual(hexRing(asTile, SIZE));
   });
 });

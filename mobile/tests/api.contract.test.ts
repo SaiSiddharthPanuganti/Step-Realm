@@ -11,17 +11,17 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { ApiClient, ApiError, type TokenStore } from '../src/api/client';
-import { login, me, signup } from '../src/api/auth';
+import { login, me, signup, updateDisplayName } from '../src/api/auth';
 import { getWorld } from '../src/api/world';
-import { claim, claimByLocation } from '../src/api/territory';
-import { syncSteps } from '../src/api/mana';
-import { manaWorth } from '../src/steps/checkpoint';
+import { getLeaderboard } from '../src/api/leaderboard';
+import { claim, claimByLocation, walkReport } from '../src/api/territory';
 import { CONTRACT_BASE_URL } from './helpers/server';
 import {
   assertClaimResponse,
-  assertManaSyncResponse,
+  assertLeaderboardResponse,
   assertTokenResponse,
   assertUser,
+  assertWalkReportResponse,
   assertWorldResponse,
 } from './helpers/shape';
 
@@ -101,6 +101,17 @@ async function findUnownedTile(
 
 /** Somewhere a brand-new player starts, near the origin but not on it. */
 const SPAWN = { lat: 12.9716, lon: 77.5946 };
+
+/**
+ * A city far from `SPAWN`, used by tests that claim several hexes.
+ *
+ * The contract world is shared and persistent for one suite run: the claim
+ * tests cluster around `SPAWN` and leave nothing unowned in its first ring
+ * by the end. Tests that need headroom claim in a city nobody else touches,
+ * so the number of free tiles each one can use is not bounded by how many
+ * earlier tests ran.
+ */
+const BOARD_CITY = { lat: 35.6762, lon: 139.6503 };
 
 afterAll(() => {
   // Nothing to tear down: globalSetup stops the server, and these tests create
@@ -196,9 +207,24 @@ describe('world', () => {
     expect(world.viewer_id).toBe(token.user.id);
   });
 
+  it('reports the claim-distance gate and per-viewer walk totals', async () => {
+    // The contract server pins MIN_CLAIM_DISTANCE_METERS to 0, so the gate's
+    // field must exist and say 0 -- and no viewer should leak another's walk
+    // metres, least of all anonymously.
+    const { client } = makeClient();
+    const world = await getWorld(client, { lat: 12.9716, lon: 77.5946, rings: 1 });
+
+    assertWorldResponse(world);
+    expect(world.claim_required_meters).toBe(0);
+    for (const tile of world.tiles) {
+      expect(tile.walk_meters).toBe(0);
+    }
+  });
+
   it('never sends an email, because the endpoint is public', async () => {
     const { client } = await signedInClient('privacy');
     const target = await findUnownedTile(client, SPAWN);
+    await walkReport(client, { lat: target.lat, lon: target.lon, meters: 20 });
     await claim(client, { q: target.q, r: target.r });
 
     const world = await getWorld(client, { lat: target.lat, lon: target.lon, rings: 1 });
@@ -209,32 +235,115 @@ describe('world', () => {
   });
 });
 
-describe('territory claims', () => {
-  it('spends the starting mana on the first claim', async () => {
-    const { client } = await signedInClient('firstclaim');
-    const before = await me(client);
-    const target = await findUnownedTile(client, SPAWN);
+describe('walk progress', () => {
+  it('banks metres into the hex the server projects the point into', async () => {
+    const { client } = await signedInClient('walkbank');
+    // Read a real centre rather than hardcoding a coordinate: the point of the
+    // endpoint is that the server decides which hex a point falls in.
+    const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
+    const centre = world.centre;
 
-    // A new account holds exactly one claim's worth of mana, and the first
-    // claim costs exactly that. Not a coincidence: it is what lets a new player
-    // put something of their own on the map immediately, while making that
-    // first tile cost something.
+    const result = await walkReport(client, {
+      lat: centre.lat,
+      lon: centre.lon,
+      meters: 5,
+    });
+
+    assertWalkReportResponse(result);
+    expect(result.q).toBe(centre.q);
+    expect(result.r).toBe(centre.r);
+    expect(result.total).toBe(5);
+    expect(result.required).toBe(0);
+    expect(result.remaining).toBe(0);
+    // One metre is one mana, and a fresh account in its first report (still
+    // inside the signup grace) is entirely walking credit.
+    expect(result.walking_gained).toBe(5);
+    expect(result.mana).toBe(5);
+  });
+
+  it('accumulates across reports in the same hex', async () => {
+    const { client } = await signedInClient('walktotal');
+    const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
+    const centre = world.centre;
+
+    await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 4 });
+    // The speed gate gives even a back-to-back request a minimum one-second
+    // window, so a report of 6 m only fits once the wall clock has actually
+    // moved forward that far. Give the second report real elapsed time instead
+    // of fighting the gate.
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+    const second = await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 6 });
+
+    assertWalkReportResponse(second);
+    expect(second.total).toBe(10);
+  });
+
+  it('rejects a walking speed no human could maintain', async () => {
+    const { client } = await signedInClient('walkspeed');
+    const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
+    const centre = world.centre;
+
+    await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 5 });
+    // An immediate 80 m claims a sprint across a campus in the milliseconds the
+    // two requests were apart. The client has to treat a 422 here as a real
+    // answer -- resending the same metres would just be rejected again -- and
+    // must not discard the walk on the floor.
+    const error = await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 80 }).catch(
+      (e: unknown) => e,
+    );
+
+    expect((error as ApiError).status).toBe(422);
+    expect((error as ApiError).isGameRule).toBe(true);
+    expect((error as ApiError).detail.toLowerCase()).toMatch(/plausible/);
+  });
+
+  it('rejects a zero delta', async () => {
+    const { client } = await signedInClient('walkzero');
+    const error = await walkReport(client, { lat: 0, lon: 0, meters: 0 }).catch(
+      (e: unknown) => e,
+    );
+    expect((error as ApiError).status).toBe(422);
+  });
+
+  it('requires a token', async () => {
+    const { client } = makeClient();
+    const error = await walkReport(client, { lat: 0, lon: 0, meters: 5 }).catch(
+      (e: unknown) => e,
+    );
+    expect((error as ApiError).status).toBe(401);
+  });
+});
+
+describe('territory claims', () => {
+  it('starts with no mana and funds the first claim by walking', async () => {
+    const { client } = await signedInClient('firstclaim');
+    const target = await findUnownedTile(client, SPAWN);
+    const before = await me(client);
+
     expect(target.owner).toBeNull();
-    expect(before.mana).toBe(20);
+    expect(before.mana).toBe(0);
     expect(before.owned_tile_count).toBe(0);
 
+    // Mana has exactly one source -- walking -- so a claim attempt before any
+    // walking is refused for lack of funds rather than silently approved.
+    const empty = await claim(client, { q: target.q, r: target.r }).catch((e: unknown) => e);
+    expect((empty as ApiError).status).toBe(402);
+
+    // Walk a claim's worth (1 m = 1 mana) and the same claim now succeeds.
+    await walkReport(client, { lat: target.lat, lon: target.lon, meters: 20 });
     const result = await claim(client, { q: target.q, r: target.r });
 
     assertClaimResponse(result);
     expect(result.tile.is_new).toBe(true);
     expect(result.mana_spent).toBe(result.claim_cost);
-    expect(result.mana).toBe(before.mana - result.claim_cost);
+    expect(result.mana).toBe(0);
     expect(result.owned_tile_count).toBe(1);
   });
 
   it('treats a repeat claim of an owned tile as a free no-op', async () => {
     const { client } = await signedInClient('retryclaim');
     const target = await findUnownedTile(client, SPAWN);
+    await walkReport(client, { lat: target.lat, lon: target.lon, meters: 20 });
     const first = await claim(client, { q: target.q, r: target.r });
 
     const again = await claim(client, { q: target.q, r: target.r });
@@ -250,32 +359,24 @@ describe('territory claims', () => {
 
   it('costs mana to expand into an adjacent tile', async () => {
     const { client } = await signedInClient('expand');
-    // Walk first. The first claim spends the entire starting balance, so there
-    // is nothing left to expand with until mana has been earned -- which is the
-    // whole reason mana has to come from walking.
-    //
-    // 2500 steps, not more: a first sync is credited against a 600-second grace
-    // period at 5 steps per second, so the server accepts at most 3000 steps
-    // however little time has actually passed.
-    await syncSteps(client, { steps_delta: 2500 });
+    // Walk first. Two claims to make and every claim costs one tile's worth of
+    // walking, so two claims' worth of metres funds both, in one report.
     const first = await findUnownedTile(client, SPAWN);
-    await claim(client, { q: first.q, r: first.r });
-
-    // Rings 1 around the tile just taken contains its six neighbours, one of
-    // which is the tile itself -- so pick a free one and the server will accept
-    // it on adjacency. Let the server be the judge: the client never decides
-    // which hexes are next to which.
-    const neighbour = await findUnownedTile(
-      client,
-      { lat: first.lat, lon: first.lon },
-      1,
+    const around = await getWorld(client, { lat: first.lat, lon: first.lon, rings: 1 });
+    const neighbour = around.tiles.find(
+      (tile) => tile.owner === null && !(tile.q === first.q && tile.r === first.r),
     );
+    if (neighbour === undefined) {
+      throw new Error('No unowned neighbour near the target tile');
+    }
+    await walkReport(client, { lat: first.lat, lon: first.lon, meters: 40 });
+    const firstClaim = await claim(client, { q: first.q, r: first.r });
     const second = await claim(client, { q: neighbour.q, r: neighbour.r });
 
     assertClaimResponse(second);
     expect(second.tile.is_new).toBe(true);
     expect(second.mana_spent).toBe(second.claim_cost);
-    expect(second.mana).toBeLessThan(second.mana_max);
+    expect(firstClaim.mana - second.claim_cost).toBe(second.mana);
     expect(second.owned_tile_count).toBe(2);
   });
 
@@ -284,8 +385,8 @@ describe('territory claims', () => {
     // Walked first, so the request fails about adjacency rather than about
     // money. Without mana it would fail with 402 and this test would pass for
     // entirely the wrong reason.
-    await syncSteps(client, { steps_delta: 2500 });
     const first = await findUnownedTile(client, SPAWN);
+    await walkReport(client, { lat: first.lat, lon: first.lon, meters: 40 });
     await claim(client, { q: first.q, r: first.r });
 
     const far = await findUnownedTile(client, SPAWN, 3);
@@ -307,6 +408,12 @@ describe('territory claims', () => {
     const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
     const centre = world.centre;
 
+    // A centre tile starts unowned and there is no generic gate on the
+    // contract server, so bank a claim's worth at the point before spending it.
+    await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 20 });
+    const walked = await me(client);
+    expect(walked.mana).toBeGreaterThanOrEqual(20);
+
     const result = await claimByLocation(client, { lat: centre.lat, lon: centre.lon });
 
     assertClaimResponse(result);
@@ -316,108 +423,200 @@ describe('territory claims', () => {
   });
 });
 
-describe('mana', () => {
-  it('reports complete state on a sync', async () => {
-    const { client } = await signedInClient('mana');
-    const result = await syncSteps(client, { steps_delta: 0 });
+describe('mana from walking', () => {
+  it('reports complete mana state on a walk report', async () => {
+    const { client } = await signedInClient('walkmana');
+    const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
+    const centre = world.centre;
 
-    assertManaSyncResponse(result);
-    expect(result.steps_credited).toBe(0);
-    expect(result.pending_step_remainder).toBe(0);
+    const result = await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 3 });
+
+    assertWalkReportResponse(result);
+    expect(result.walking_gained).toBe(3);
+    expect(result.passive_gained).toBe(0);
     expect(result.total_mana_gained).toBe(
-      result.passive_mana_gained + result.walking_mana_gained,
+      result.walking_gained + result.passive_gained,
     );
+    expect(result.mana).toBe(result.total_mana_gained);
   });
 
-  it('credits a walking block on a first sync', async () => {
-    const { client } = await signedInClient('walk');
-    // A full block is 1000 steps for 20 mana. The server skips the speed check
-    // for the first 10 minutes after signup, so a brand-new account can sync a
-    // block immediately -- and the client should not assume otherwise, or it
-    // will refuse to bank the steps a player took before installing.
-    const result = await syncSteps(client, { steps_delta: 1000 });
+  it('credits one mana per metre walked', async () => {
+    const { client } = await signedInClient('permetre');
+    const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
+    const centre = world.centre;
 
-    assertManaSyncResponse(result);
-    expect(result.steps_credited).toBe(1000);
-    expect(result.walking_mana_gained).toBeGreaterThan(0);
-    expect(result.pending_step_remainder).toBe(0);
+    const result = await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 25 });
+
+    assertWalkReportResponse(result);
+    expect(result.walking_gained).toBe(25);
+    expect(result.daily_mana_earned).toBe(25);
   });
 
-  it('banks a partial block toward the next one', async () => {
-    const { client } = await signedInClient('partial');
-    // Fewer than a full block earns nothing but is not discarded. If the
-    // remainder were dropped, a walk that ends mid-block would pay nothing and
-    // the player would never find out why.
-    const result = await syncSteps(client, { steps_delta: 400 });
+  it('counts walking against the daily cap', async () => {
+    const { client } = await signedInClient('daily');
+    const world = await getWorld(client, { lat: 19.076, lon: 72.8777, rings: 0 });
+    const centre = world.centre;
 
-    assertManaSyncResponse(result);
-    expect(result.steps_credited).toBe(400);
-    expect(result.pending_step_remainder).toBe(400);
-    expect(result.walking_mana_gained).toBe(0);
+    const first = await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 25 });
+    // Give the plausibility clock a real second before the next report so the
+    // request is judged on elapsed time, not on the millisecond it took to run
+    // -- and walk slowly enough that the speed gate accepts it.
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+    const second = await walkReport(client, { lat: centre.lat, lon: centre.lon, meters: 4 });
+
+    assertWalkReportResponse(second);
+    expect(first.daily_mana_earned).toBe(25);
+    expect(second.daily_mana_earned).toBe(29);
+    // What is left of the cap budget goes down by exactly what was earned.
+    expect(second.daily_mana_remaining).toBe(first.daily_mana_remaining - 4);
+    expect(second.total_mana_gained).toBe(4);
   });
 
-  it('rejects a delta larger than a first sync can justify', async () => {
-    const { client } = await signedInClient('toomany');
-    // 5000 steps at 5 steps per second needs 1000 seconds of walking. A first
-    // sync is only credited against a 600-second grace, so this is rejected
-    // however fresh the account is. The client has to treat a 422 here as a
-    // real answer -- resending the same number would just be rejected again --
-    // and must not discard the player's steps on the floor.
-    const error = await syncSteps(client, { steps_delta: 5000 }).catch((e: unknown) => e);
-
-    expect(error).toBeInstanceOf(ApiError);
+  it('rejects a zero delta', async () => {
+    const { client } = await signedInClient('walkzero');
+    const error = await walkReport(client, { lat: 0, lon: 0, meters: 0 }).catch(
+      (e: unknown) => e,
+    );
     expect((error as ApiError).status).toBe(422);
-    expect((error as ApiError).detail.toLowerCase()).toMatch(/plausible|walked/);
-  });
-
-  it('rejects a negative delta with 422', async () => {
-    const { client } = await signedInClient('negative');
-
-    const error = await syncSteps(client, { steps_delta: -5 }).catch((e: unknown) => e);
-
-    expect((error as ApiError).status).toBe(422);
-  });
-
-  it('credits exactly what the client preview promises', async () => {
-    // The sync button renders "+N mana" computed by `manaWorth`, so if that
-    // function ever rounds differently from the server the UI makes a promise
-    // the server does not keep. Nothing else would catch it: the sync still
-    // succeeds, mana still changes, and the only symptom is a number on a
-    // button being wrong.
-    //
-    // A fresh account per case, deliberately. Only a *first* sync gets the
-    // 600-second grace, so a second sync on the same account is judged against
-    // elapsed time and would be rejected for reasons that have nothing to do
-    // with the arithmetic under test.
-    for (const steps of [0, 400, 999, 1_000, 1_500, 2_500]) {
-      const { client } = await signedInClient(`preview${steps}`);
-      const result = await syncSteps(client, { steps_delta: steps });
-
-      expect(result.walking_mana_gained).toBe(manaWorth(steps));
-    }
-  });
-
-  it('rejects a second sync however small, because the first set the clock', async () => {
-    // A consequence of the plausibility check that the client has to design
-    // around: eligibility is measured from the last *credited* sync, so once one
-    // has happened a follow-up a second later is capped at about five steps and
-    // anything larger is a 422. A client that retried a failed sync in a loop, or
-    // synced on a timer, would break its own sync button.
-    //
-    // Pinning this because it is invisible from the client: nothing in the
-    // response says "you are now rate limited by walking speed".
-    const { client } = await signedInClient('twice');
-
-    await syncSteps(client, { steps_delta: 1_000 });
-    const second = await syncSteps(client, { steps_delta: 800 }).catch((e: unknown) => e);
-
-    expect(second).toBeInstanceOf(ApiError);
-    expect((second as ApiError).status).toBe(422);
   });
 
   it('requires a token', async () => {
     const { client } = makeClient();
-    const error = await syncSteps(client, { steps_delta: 0 }).catch((e: unknown) => e);
+    const error = await walkReport(client, { lat: 0, lon: 0, meters: 5 }).catch(
+      (e: unknown) => e,
+    );
+    expect((error as ApiError).status).toBe(401);
+  });
+});
+
+describe('display name', () => {
+  it('renames the account and the profile reflects it', async () => {
+    const { client } = await signedInClient('rename');
+    const renamed = await updateDisplayName(client, 'TheFirstWalker');
+
+    assertUser(renamed);
+    expect(renamed.display_name).toBe('TheFirstWalker');
+    expect((await me(client)).display_name).toBe('TheFirstWalker');
+  });
+
+  it('quotes back the derived name until a name is chosen', async () => {
+    const { client } = await signedInClient('derived');
+    // The server stamps a name from the email stem at signup, so `me` never
+    // comes back empty -- the map has a label to draw either way.
+    const current = await me(client);
+    expect(current.display_name.length).toBeGreaterThan(0);
+    expect(current.display_name.length).toBeLessThanOrEqual(24);
+  });
+
+  it('rejects a name another player holds with 409', async () => {
+    const a = await signedInClient('holder');
+    const b = await signedInClient('taker');
+    await updateDisplayName(a.client, 'ReservedOne');
+
+    const conflict = await updateDisplayName(b.client, 'ReservedOne').catch(
+      (e: unknown) => e,
+    );
+    expect((conflict as ApiError).status).toBe(409);
+    expect((conflict as ApiError).isGameRule).toBe(true);
+  });
+
+  it('rejects characters and lengths the server will not store', async () => {
+    const { client } = await signedInClient('invalidname');
+
+    const spaced = await updateDisplayName(client, 'bad name!').catch((e: unknown) => e);
+    expect((spaced as ApiError).status).toBe(422);
+
+    const tooShort = await updateDisplayName(client, 'ab').catch((e: unknown) => e);
+    expect((tooShort as ApiError).status).toBe(422);
+  });
+
+  it('requires a token', async () => {
+    const { client } = makeClient();
+    const error = await updateDisplayName(client, 'Anonymous').catch((e: unknown) => e);
+    expect((error as ApiError).status).toBe(401);
+  });
+});
+
+describe('leaderboard', () => {
+  it('posts a claimer onto the board and pins the viewer unranked', async () => {
+    const claimer = await signedInClient('rankclaim');
+    const target = await findUnownedTile(claimer.client, BOARD_CITY, 2);
+    await walkReport(claimer.client, { lat: target.lat, lon: target.lon, meters: 20 });
+    await claim(claimer.client, { q: target.q, r: target.r });
+
+    const onlooker = await signedInClient('rankview');
+    const board = await getLeaderboard(onlooker.client, 100);
+
+    assertLeaderboardResponse(board);
+    // The board is shared and keeps every player who claimed before page
+    // load, so it asserts *positioning*, not emptiness: the fresh claimer is
+    // on the board owning exactly one hex, and the list is ordered by
+    // territory descending.
+    expect(board.entries.length).toBeGreaterThan(0);
+    const mine = board.entries.find((entry) => entry.user_id === claimer.token.user.id);
+    expect(mine?.owned_tile_count).toBe(1);
+    expect(mine?.rank).toBeGreaterThanOrEqual(1);
+    const counts = board.entries.map((entry) => entry.owned_tile_count);
+    expect([...counts].sort((a, b) => b - a)).toEqual(counts);
+    // The caller's own standing travels with the response even though they
+    // own nothing: unranked, not "last".
+    expect(board.viewer?.user_id).toBe(onlooker.token.user.id);
+    expect(board.viewer?.owned_tile_count).toBe(0);
+    expect(board.viewer?.rank).toBeNull();
+    expect(board.degraded).toBe(true);
+  });
+
+  it('orders claimers by territory descending with the stable tie-break', async () => {
+    const one = await signedInClient('boar');
+    const two = await signedInClient('border');
+    const first = await findUnownedTile(one.client, BOARD_CITY, 2);
+    await walkReport(one.client, { lat: first.lat, lon: first.lon, meters: 40 });
+    await claim(one.client, { q: first.q, r: first.r });
+    const around = await getWorld(one.client, { lat: first.lat, lon: first.lon, rings: 1 });
+    const neighbour = around.tiles.find(
+      (tile) => tile.owner === null && !(tile.q === first.q && tile.r === first.r),
+    );
+    if (neighbour === undefined) {
+      throw new Error('No unowned neighbour near the target tile');
+    }
+    await claim(one.client, { q: neighbour.q, r: neighbour.r });
+
+    const second = await findUnownedTile(two.client, BOARD_CITY, 2);
+    await walkReport(two.client, { lat: second.lat, lon: second.lon, meters: 40 });
+    await claim(two.client, { q: second.q, r: second.r });
+    const aroundTwo = await getWorld(two.client, { lat: second.lat, lon: second.lon, rings: 1 });
+    const neighbourTwo = aroundTwo.tiles.find(
+      (tile) => tile.owner === null && !(tile.q === second.q && tile.r === second.r),
+    );
+    if (neighbourTwo === undefined) {
+      throw new Error('No unowned neighbour near the second target tile');
+    }
+    await claim(two.client, { q: neighbourTwo.q, r: neighbourTwo.r });
+
+    const board = await getLeaderboard(one.client, 100);
+
+    assertLeaderboardResponse(board);
+    // Territory descending, no ties out of order anywhere in the list.
+    const counts = board.entries.map((entry) => entry.owned_tile_count);
+    expect([...counts].sort((a, b) => b - a)).toEqual(counts);
+    // Both leaders hold two hexes; the shared board may hold other two-hex
+    // players too, but between a tied pair the stable user-id order decides,
+    // and neither leader can rank below a one-hex player.
+    const oneIndex = board.entries.findIndex((entry) => entry.user_id === one.token.user.id);
+    const twoIndex = board.entries.findIndex((entry) => entry.user_id === two.token.user.id);
+    expect(oneIndex).toBeGreaterThan(-1);
+    expect(twoIndex).toBeGreaterThan(-1);
+    expect(oneIndex).toBeLessThan(twoIndex);
+    expect(board.entries[oneIndex].owned_tile_count).toBe(2);
+    expect(board.entries[twoIndex].owned_tile_count).toBe(2);
+    expect(board.viewer?.user_id).toBe(one.token.user.id);
+    expect(board.viewer?.owned_tile_count).toBe(2);
+    expect(board.viewer?.rank).toBeGreaterThanOrEqual(1);
+  });
+
+  it('requires a token', async () => {
+    const { client } = makeClient();
+    const error = await getLeaderboard(client).catch((e: unknown) => e);
     expect((error as ApiError).status).toBe(401);
   });
 });

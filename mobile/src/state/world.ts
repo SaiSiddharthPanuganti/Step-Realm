@@ -119,12 +119,12 @@ export function useClaimByLocation() {
 }
 
 /**
- * Note there is deliberately no `useSyncSteps` here.
+ * Note there is deliberately no walk-reports mutation here.
  *
- * Reporting steps is not a plain mutation, because the delta must be steps since
- * the last *successful* sync -- a retried request after a timeout would
- * otherwise credit the same walk twice. That bookkeeping lives in
- * `useStepTracker`, which owns the persisted ledger and is the only thing that
+ * Reporting a walk is not a plain mutation, because each report must carry the
+ * metres walked since the last *successful* report -- a retried request after a
+ * timeout would otherwise credit the same walk twice. That bookkeeping lives in
+ * `useWalkTracker`, which owns the pending ledger and is the only thing that
  * may decide what a delta is. A second mutation that took a raw number would be
  * a way to bypass the one rule that stops a walk being paid for twice.
  */

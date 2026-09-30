@@ -13,5 +13,6 @@ from app.models.college import College
 from app.models.hex_tile import HexTile
 from app.models.rate_limit_counter import RateLimitCounter
 from app.models.user import User
+from app.models.walk_progress import WalkProgress
 
-__all__ = ["Base", "College", "HexTile", "RateLimitCounter", "User"]
+__all__ = ["Base", "College", "HexTile", "RateLimitCounter", "User", "WalkProgress"]

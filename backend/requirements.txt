@@ -28,3 +28,8 @@ bcrypt==5.0.0
 email-validator==2.3.0
 
 redis==8.1.0
+# The walkability classifier's own OpenStreetMap-over-HTTPS client uses the
+# bundled Mozilla CA bundle instead of the OS store, which on some Windows
+# installs cannot resolve the Let's Encrypt chain Overpass serves. Declared
+# because urllib use is a deliberate new dependency.
+certifi==2026.07.22

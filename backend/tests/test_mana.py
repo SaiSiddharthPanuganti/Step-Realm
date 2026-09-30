@@ -3,7 +3,8 @@
 The regeneration and reward arithmetic is tested against the service with an
 explicit ``now`` so every case is exact and instantaneous -- no sleeping, no
 flakiness. The endpoint behaviour is then tested over HTTP against the real
-clock.
+clock: walking is now the only mana faucet, so ``POST /territory/walk`` is the
+endpoint those tests exercise, not a dedicated mana-sync route.
 """
 
 from __future__ import annotations
@@ -16,19 +17,16 @@ from app.core.constants import (
     DAILY_WALKING_MANA_CAP,
     INITIAL_MANA,
     MANA_MAX,
-    MANA_PER_STEP_BLOCK,
     MANA_REGEN_AMOUNT,
     MANA_REGEN_PERIOD_MINUTES,
-    STEPS_PER_MANA_BLOCK,
 )
 from app.services import mana_service
 from app.services.mana_service import (
     apply_passive_regen,
-    apply_walking_steps,
+    apply_walking_metres,
     next_daily_reset,
     settle_mana,
 )
-from tests.conftest import VALID_EMAIL
 
 T0 = mana_service.utcnow().replace(microsecond=0)
 REGEN_PERIOD = timedelta(minutes=MANA_REGEN_PERIOD_MINUTES)
@@ -47,7 +45,6 @@ def a_user(**overrides):
             self.last_mana_regen_at = T0
             self.daily_mana_earned = 0
             self.daily_mana_reset_at = T0 + timedelta(days=1)
-            self.pending_step_remainder = 0
 
     user = _User()
     for key, value in overrides.items():
@@ -183,65 +180,57 @@ def test_next_daily_reset_is_strictly_in_the_future() -> None:
 
 
 # ---------------------------------------------------------------------------
-# walking reward
+# walking reward: metres -> mana
 # ---------------------------------------------------------------------------
 
 
-def test_one_full_block_grants_twenty() -> None:
+def test_twenty_metres_grant_twenty_mana() -> None:
+    """The product loop in one line: walk 20 m, earn the 20-mana claim."""
     user = a_user()
-    gained, forfeited_cap, forfeited_max = apply_walking_steps(
-        user, STEPS_PER_MANA_BLOCK, T0
-    )
-    assert gained == MANA_PER_STEP_BLOCK
+    gained, forfeited_cap, forfeited_max = apply_walking_metres(user, 20.0, T0)
+
+    assert gained == 20
     assert forfeited_cap == 0
     assert forfeited_max == 0
     assert user.mana == 20
-    assert user.pending_step_remainder == 0
     assert user.daily_mana_earned == 20
 
 
-def test_one_step_short_grants_nothing_but_keeps_the_steps() -> None:
-    user = a_user()
-    gained, _, _ = apply_walking_steps(user, STEPS_PER_MANA_BLOCK - 1, T0)
-    assert gained == 0
-    assert user.pending_step_remainder == STEPS_PER_MANA_BLOCK - 1
+def test_sub_metre_fraction_truncates() -> None:
+    """One mana per metre, whole mana per report.
 
-
-def test_fractional_blocks_carry_forward() -> None:
-    """1,500 steps is 20 mana *and* 500 banked steps.
-
-    Discarding the fraction would cost a real player up to 19 mana on every
-    sync, which is why migration 0002 added the remainder column.
+    25.9 m is 25 mana, not 26, and a single fractional metre is worth
+    nothing at all. At 1:1 the truncation loses at most one mana per report,
+    which is the cost of keeping the balance an integer.
     """
     user = a_user()
-    gained, _, _ = apply_walking_steps(user, 1_500, T0)
-    assert gained == MANA_PER_STEP_BLOCK
-    assert user.pending_step_remainder == 500
+    gained, _, _ = apply_walking_metres(user, 25.9, T0)
+    assert gained == 25
+    assert user.mana == 25
 
-    gained, _, _ = apply_walking_steps(user, 500, T0)
-    assert gained == MANA_PER_STEP_BLOCK
-    assert user.pending_step_remainder == 0
-    assert user.mana == 40
-
-
-def test_accumulating_across_many_syncs_reaches_the_same_total() -> None:
-    """Whether you sync once or a hundred times must not change the payout."""
-    bulk = a_user()
-    apply_walking_steps(bulk, 3_700, T0)
-
-    drip = a_user()
-    for _ in range(37):
-        apply_walking_steps(drip, 100, T0)
-
-    assert bulk.mana == drip.mana == 60
-    assert bulk.pending_step_remainder == drip.pending_step_remainder == 700
+    tiny = a_user()
+    gained, _, _ = apply_walking_metres(tiny, 0.9, T0)
+    assert gained == 0
+    assert tiny.mana == 0
 
 
-def test_zero_steps_grants_nothing() -> None:
+def test_zero_metres_grants_nothing() -> None:
     user = a_user()
-    gained, _, _ = apply_walking_steps(user, 0, T0)
+    gained, _, _ = apply_walking_metres(user, 0.0, T0)
     assert gained == 0
     assert user.mana == 0
+
+
+def test_accumulating_across_many_reports_reaches_the_same_total() -> None:
+    """Whether you report once or a hundred times must not change the payout."""
+    bulk = a_user()
+    apply_walking_metres(bulk, 100.0, T0)
+
+    drip = a_user()
+    for _ in range(10):
+        apply_walking_metres(drip, 10.0, T0)
+
+    assert bulk.mana == drip.mana == 100
 
 
 # ---------------------------------------------------------------------------
@@ -249,49 +238,43 @@ def test_zero_steps_grants_nothing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_daily_cap_allows_exactly_ten_blocks() -> None:
+def test_daily_cap_absorbs_an_over_allowance_walk() -> None:
     user = a_user()
-    gained, forfeited, _ = apply_walking_steps(
-        user, STEPS_PER_MANA_BLOCK * 10, T0
-    )
+    gained, forfeited, _ = apply_walking_metres(user, 2500.0, T0)
+
     assert gained == DAILY_WALKING_MANA_CAP
-    assert forfeited == 0
+    assert forfeited == 2500 - DAILY_WALKING_MANA_CAP
     assert user.daily_mana_earned == DAILY_WALKING_MANA_CAP
+    # MANA_MAX is a holding cap, not an earning cap: the walk filled the bar
+    # and the difference vanished. Both caps still bind on their own axis.
+    assert user.mana == MANA_MAX
 
 
-def test_eleventh_block_is_forfeited() -> None:
-    user = a_user()
-    apply_walking_steps(user, STEPS_PER_MANA_BLOCK * 10, T0)
-    gained, forfeited, _ = apply_walking_steps(user, STEPS_PER_MANA_BLOCK, T0)
-
-    assert gained == 0
-    assert forfeited == MANA_PER_STEP_BLOCK
-    assert user.mana == DAILY_WALKING_MANA_CAP
-
-
-def test_partial_headroom_does_not_grant_a_partial_block() -> None:
-    """Blocks are indivisible: 10 mana of headroom buys nothing."""
-    user = a_user(daily_mana_earned=DAILY_WALKING_MANA_CAP - 10)
-    gained, forfeited, _ = apply_walking_steps(user, STEPS_PER_MANA_BLOCK, T0)
-
-    assert gained == 0
-    assert forfeited == MANA_PER_STEP_BLOCK
-
-
-def test_remainder_still_carries_while_the_cap_is_exhausted() -> None:
+def test_exhausted_daily_cap_forfeits_further_walking() -> None:
     user = a_user(daily_mana_earned=DAILY_WALKING_MANA_CAP)
-    gained, forfeited, _ = apply_walking_steps(user, 600, T0)
+    gained, forfeited, _ = apply_walking_metres(user, 25.0, T0)
 
     assert gained == 0
-    assert forfeited == 0
-    assert user.pending_step_remainder == 600
+    assert forfeited == 25
+    assert user.mana == 0
+
+
+def test_partial_headroom_grants_partial_mana() -> None:
+    """Mana is divisible, unlike the old step blocks: 10 mana of headroom
+    buys the 10 mana it can fit and forfeits only the rest."""
+    user = a_user(daily_mana_earned=DAILY_WALKING_MANA_CAP - 10)
+    gained, forfeited, _ = apply_walking_metres(user, 25.0, T0)
+
+    assert gained == 10
+    assert forfeited == 15
+    assert user.daily_mana_earned == DAILY_WALKING_MANA_CAP
 
 
 def test_cap_resets_and_earnings_resume() -> None:
     user = a_user(daily_mana_earned=DAILY_WALKING_MANA_CAP)
     settle_mana(user, now=T0 + timedelta(days=1, seconds=1))
-    gained, _, _ = apply_walking_steps(user, STEPS_PER_MANA_BLOCK, T0)
-    assert gained == MANA_PER_STEP_BLOCK
+    gained, _, _ = apply_walking_metres(user, 20.0, T0)
+    assert gained == 20
 
 
 # ---------------------------------------------------------------------------
@@ -307,32 +290,32 @@ def test_mana_earned_above_the_cap_is_still_counted_against_the_daily_cap() -> N
     instant they spend 20 on a tile.
     """
     user = a_user(mana=MANA_MAX)
-    gained, _, forfeited_max = apply_walking_steps(user, 1_000, T0)
+    gained, _, forfeited_max = apply_walking_metres(user, 25.0, T0)
 
-    assert gained == MANA_PER_STEP_BLOCK
+    assert gained == 25
     assert user.mana == MANA_MAX
-    assert forfeited_max == MANA_PER_STEP_BLOCK
-    assert user.daily_mana_earned == MANA_PER_STEP_BLOCK
+    assert forfeited_max == 25
+    assert user.daily_mana_earned == 25
 
 
 def test_capped_earnings_cannot_be_redeemed_after_spending() -> None:
     """End-to-end proof of the previous rule.
 
-    Walk 10,000 steps against a full bar, then spend 20 on a tile. The player
-    must be left near zero, not handed a fresh full bar.
+    Walk 2,500 m against a full bar, then spend 20 on a tile. The player must
+    be left near zero, not handed a fresh full bar.
     """
     user = a_user(mana=MANA_MAX)
-    apply_walking_steps(user, 10_000, T0)
+    apply_walking_metres(user, 2500.0, T0)
     assert user.mana == MANA_MAX
     assert user.daily_mana_earned == DAILY_WALKING_MANA_CAP
 
     user.mana -= 20  # as a tile claim would
-    assert user.mana == 180
+    assert user.mana == MANA_MAX - 20
 
     # The day's allowance is spent, so no more walking mana today.
-    gained, _, _ = apply_walking_steps(user, 1_000, T0)
+    gained, _, _ = apply_walking_metres(user, 25.0, T0)
     assert gained == 0
-    assert user.mana == 180
+    assert user.mana == MANA_MAX - 20
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +326,7 @@ def test_capped_earnings_cannot_be_redeemed_after_spending() -> None:
 def test_regen_and_walking_combine_in_one_settlement() -> None:
     user = a_user(mana=0)
     outcome = settle_mana(
-        user, steps=1_000, now=T0 + REGEN_PERIOD * 2
+        user, walk_meters=20.0, now=T0 + REGEN_PERIOD * 2
     )
     assert outcome.passive_gained == 10
     assert outcome.walking_gained == 20
@@ -353,15 +336,16 @@ def test_regen_and_walking_combine_in_one_settlement() -> None:
 
 def test_settlement_never_exceeds_mana_max() -> None:
     user = a_user(mana=MANA_MAX - 10)
-    settle_mana(user, steps=5_000, now=T0 + REGEN_PERIOD * 4)
+    settle_mana(user, walk_meters=100.0, now=T0 + REGEN_PERIOD * 4)
     assert user.mana == MANA_MAX
 
 
 def test_outcome_reports_forfeited_mana_max() -> None:
     user = a_user(mana=MANA_MAX)
-    outcome = settle_mana(user, steps=1_000, now=T0)
-    assert outcome.mana_forfeited_to_mana_max == MANA_PER_STEP_BLOCK
-    assert outcome.walking_gained == MANA_PER_STEP_BLOCK
+    outcome = settle_mana(user, walk_meters=25.0, now=T0)
+    assert outcome.mana_forfeited_to_mana_max == 25
+    assert outcome.walking_gained == 25
+    assert outcome.walk_meters_credited == 25.0
 
 
 def test_naive_datetime_is_rejected() -> None:
@@ -372,116 +356,70 @@ def test_naive_datetime_is_rejected() -> None:
         settle_mana(user, now=datetime(2026, 1, 1, 12, 0, 0))
 
 
-def test_negative_steps_are_rejected() -> None:
+def test_negative_metres_are_rejected() -> None:
     user = a_user()
     with pytest.raises(ValueError, match="non-negative"):
-        apply_walking_steps(user, -1, T0)
+        apply_walking_metres(user, -1.0, T0)
 
 
 # ---------------------------------------------------------------------------
-# HTTP: POST /mana/sync
+# HTTP: walking is the mana faucet (POST /territory/walk)
 # ---------------------------------------------------------------------------
 
 
-def test_sync_requires_authentication(client) -> None:
-    assert client.post("/mana/sync", json={"steps_delta": 1000}).status_code == 401
+def test_walk_requires_authentication(client) -> None:
+    response = client.post(
+        "/territory/walk", json={"lat": 0.0, "lon": 0.0, "meters": 20.0}
+    )
+    assert response.status_code == 401
 
 
-def test_sync_credits_a_full_block(client, authed) -> None:
+def test_walk_credits_mana(client, authed) -> None:
+    """The full loop in one request: 20 m inside a hex earns the 20 mana the
+    claim will cost, on top of the (now zero) starting balance."""
     authed()
     response = client.post(
-        "/mana/sync", json={"steps_delta": 1000}, headers=authed()
+        "/territory/walk",
+        json={"lat": 0.0, "lon": 0.0, "meters": 20.0},
+        headers=authed(),
     )
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["walking_mana_gained"] == 20
+    assert body["walking_gained"] == 20
+    assert body["passive_gained"] == 0
     assert body["total_mana_gained"] == 20
     assert body["mana"] == INITIAL_MANA + 20
     assert body["mana_max"] == MANA_MAX
-    assert body["pending_step_remainder"] == 0
     assert body["daily_mana_earned"] == 20
     assert body["daily_mana_remaining"] == DAILY_WALKING_MANA_CAP - 20
 
 
-def test_sync_returns_full_state_for_offline_reconciliation(client, authed) -> None:
+def test_walk_returns_full_state_for_offline_reconciliation(client, authed) -> None:
     """The client must be able to replace its whole display from this one
     response, per the spec's reconciliation requirement."""
     authed()
     body = client.post(
-        "/mana/sync", json={"steps_delta": 1_500}, headers=authed()
+        "/territory/walk",
+        json={"lat": 0.0, "lon": 0.0, "meters": 12.5},
+        headers=authed(),
     ).json()
 
     for field in (
+        "q",
+        "r",
+        "total",
+        "required",
+        "remaining",
         "mana",
         "mana_max",
-        "passive_mana_gained",
-        "walking_mana_gained",
+        "walking_gained",
+        "passive_gained",
         "total_mana_gained",
-        "steps_credited",
-        "pending_step_remainder",
         "daily_mana_earned",
         "daily_mana_remaining",
-        "daily_reset_at",
-        "mana_forfeited_to_daily_cap",
-        "mana_forfeited_to_mana_max",
     ):
         assert field in body, field
-
-
-def test_sync_rejects_a_negative_delta(client, authed) -> None:
-    authed()
-    response = client.post(
-        "/mana/sync", json={"steps_delta": -5}, headers=authed()
-    )
-    assert response.status_code == 422
-
-
-def test_sync_rejects_an_absurd_delta(client, authed, no_step_speed_cap) -> None:
-    from app.core.constants import MAX_STEPS_PER_SYNC
-
-    authed()
-    assert (
-        client.post(
-            "/mana/sync",
-            json={"steps_delta": MAX_STEPS_PER_SYNC + 1},
-            headers=authed(),
-        ).status_code
-        == 422
-    )
-    assert (
-        client.post(
-            "/mana/sync",
-            json={"steps_delta": MAX_STEPS_PER_SYNC},
-            headers=authed(),
-        ).status_code
-        == 200
-    )
-
-
-def test_sync_persists_the_remainder_across_calls(
-    client, authed, no_step_speed_cap
-) -> None:
-    from sqlalchemy import text as sql_text
-
-    from app.db.session import get_session_factory
-    from app.services.auth_service import normalise_email
-
-    authed()
-    client.post("/mana/sync", json={"steps_delta": 1_500}, headers=authed())
-    client.post("/mana/sync", json={"steps_delta": 500}, headers=authed())
-
-    with get_session_factory()() as read_session:
-        row = read_session.execute(
-            sql_text(
-                "SELECT mana, pending_step_remainder FROM users "
-                "WHERE email = :email"
-            ),
-            {"email": normalise_email(VALID_EMAIL)},
-        ).mappings().one()
-
-    assert row["pending_step_remainder"] == 0
-    assert row["mana"] == INITIAL_MANA + 40
 
 
 # ---------------------------------------------------------------------------

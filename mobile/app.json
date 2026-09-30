@@ -48,7 +48,16 @@
         {
           "motionPermission": "StepRealm counts the steps you walk to earn mana for claiming territory."
         }
-      ]
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "./plugins/withNdkStlLink"
     ],
     "experiments": {
       "typedRoutes": true

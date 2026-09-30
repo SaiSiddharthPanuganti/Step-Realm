@@ -11,10 +11,19 @@
 import { create } from 'zustand';
 
 import { api, setUnauthorizedHandler } from '../api/runtime';
-import { login as loginRequest, me as fetchMe, signup as signupRequest } from '../api/auth';
+import {
+  login as loginRequest,
+  me as fetchMe,
+  signup as signupRequest,
+  updateDisplayName as updateDisplayNameRequest,
+} from '../api/auth';
 import { ApiError } from '../api/errors';
 import type { User } from '../api/types';
 import { SecureTokenStore } from './tokenStore';
+import {
+  hasCompletedDisplayName,
+  markDisplayNameCompleted,
+} from './onboarding';
 
 export type SessionStatus = 'restoring' | 'signed-out' | 'signed-in';
 
@@ -26,6 +35,12 @@ export interface Credentials {
 interface SessionState {
   status: SessionStatus;
   user: User | null;
+  /**
+   * The player has not yet chosen their display name, so the app must send
+   * them through the naming screen before the map. True for any account whose
+   * marker has not been stored -- which is exactly every fresh signup.
+   */
+  needsDisplayName: boolean;
   /** Why the last attempt failed, for display next to the form. */
   error: string | null;
   busy: boolean;
@@ -36,6 +51,8 @@ interface SessionState {
   signOut: () => Promise<void>;
   /** Adopt a fresher user object, e.g. after a claim changed the mana balance. */
   updateUser: (user: User) => void;
+  /** Save the chosen display name and clear the onboarding gate. */
+  setDisplayName: (displayName: string) => Promise<void>;
 }
 
 const store = new SecureTokenStore();
@@ -57,6 +74,7 @@ function messageFor(error: unknown): string {
 export const useSession = create<SessionState>((set, get) => ({
   status: 'restoring',
   user: null,
+  needsDisplayName: false,
   error: null,
   busy: false,
 
@@ -72,7 +90,7 @@ export const useSession = create<SessionState>((set, get) => ({
    * A network failure is treated as *not* signed out. Being unable to reach the
    * server says nothing about whether the token is valid, and signing the
    * player out because they are in a lift would throw away a working session
-   * and their unsynced steps with it. So: only a 401 ends the session.
+   * and their unsynced walk with it. So: only a 401 ends the session.
    */
   async restore() {
     set({ status: 'restoring', error: null });
@@ -93,7 +111,8 @@ export const useSession = create<SessionState>((set, get) => ({
 
     try {
       const user = await fetchMe(api);
-      set({ status: 'signed-in', user });
+      const needsDisplayName = !(await hasCompletedDisplayName(user.id));
+      set({ status: 'signed-in', user, needsDisplayName });
     } catch (error) {
       if (error instanceof ApiError && error.isAuthFailure) {
         await store.clear().catch(() => undefined);
@@ -116,11 +135,17 @@ export const useSession = create<SessionState>((set, get) => ({
 
   async signOut() {
     await store.clear().catch(() => undefined);
-    set({ status: 'signed-out', user: null, error: null });
+    set({ status: 'signed-out', user: null, needsDisplayName: false, error: null });
   },
 
   updateUser(user) {
     set({ user });
+  },
+
+  async setDisplayName(displayName) {
+    const user = await updateDisplayNameRequest(api, displayName);
+    await markDisplayNameCompleted(user.id);
+    set({ user, needsDisplayName: false });
   },
 }));
 
@@ -144,7 +169,8 @@ async function authenticate(
     // two leaves a recoverable state (signed out) rather than a signed-in UI
     // with no token behind it.
     await store.set(response.access_token);
-    set({ status: 'signed-in', user: response.user, busy: false, error: null });
+    const needsDisplayName = !(await hasCompletedDisplayName(response.user.id));
+    set({ status: 'signed-in', user: response.user, needsDisplayName, busy: false, error: null });
     return true;
   } catch (error) {
     set({ busy: false, error: messageFor(error) });

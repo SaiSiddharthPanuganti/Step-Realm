@@ -123,6 +123,8 @@ export function assertWorldResponse(value: unknown, label = 'world'): void {
   requireNumber(obj, 'hex_size_meters', label);
   requireNullableNumber(obj, 'viewer_id', label);
   requireBoolean(obj, 'latitude_was_clamped', label);
+  requireBoolean(obj, 'walkability_degraded', label);
+  requireNumber(obj, 'claim_required_meters', label);
 
   const bounds = requireObject(requireField(obj, 'bounds', label), `${label}.bounds`);
   for (const key of [
@@ -138,12 +140,32 @@ export function assertWorldResponse(value: unknown, label = 'world'): void {
     for (const key of ['q', 'r', 'world_x', 'world_y', 'lat', 'lon']) {
       requireNumber(t, key, `${label}.tile`);
     }
+    requireNumber(t, 'walk_meters', `${label}.tile`);
     const owner = requireField(t, 'owner', `${label}.tile`);
     if (owner !== null) {
       const o = requireObject(owner, `${label}.tile.owner`);
       requireNumber(o, 'id', `${label}.tile.owner`);
       requireString(o, 'display_name', `${label}.tile.owner`);
     }
+  }
+}
+
+export function assertWalkReportResponse(value: unknown, label = 'walk report'): void {
+  const obj = requireObject(value, label);
+  requireNumber(obj, 'q', label);
+  requireNumber(obj, 'r', label);
+  requireNumber(obj, 'total', label);
+  requireNumber(obj, 'required', label);
+  requireNumber(obj, 'remaining', label);
+  // A walk report is now a mana transaction too, so its mana half must arrive
+  // with the metres: the daily numbers are what a client would show a player
+  // who asks where the money went.
+  for (const key of [
+    'mana', 'mana_max',
+    'walking_gained', 'passive_gained', 'total_mana_gained',
+    'daily_mana_earned', 'daily_mana_remaining',
+  ]) {
+    requireNumber(obj, key, label);
   }
 }
 
@@ -161,22 +183,28 @@ export function assertClaimResponse(value: unknown, label = 'claim'): void {
   requireNumber(obj, 'claim_cost', label);
 }
 
-export function assertManaSyncResponse(value: unknown, label = 'mana sync'): void {
+export function assertLeaderboardResponse(value: unknown, label = 'leaderboard'): void {
   const obj = requireObject(value, label);
-  for (const key of [
-    'mana', 'mana_max',
-    'passive_mana_gained', 'walking_mana_gained', 'total_mana_gained',
-    'steps_credited', 'pending_step_remainder',
-    'daily_mana_earned', 'daily_mana_remaining',
-    'mana_forfeited_to_daily_cap', 'mana_forfeited_to_mana_max',
-  ]) {
-    requireNumber(obj, key, label);
+  requireNumber(obj, 'limit', label);
+  requireBoolean(obj, 'degraded', label);
+
+  const entries = requireArray(obj, 'entries', label);
+  for (const entry of entries) {
+    const e = requireObject(entry, `${label}.entry`);
+    requireNumber(e, 'rank', `${label}.entry`);
+    requireNumber(e, 'user_id', `${label}.entry`);
+    requireString(e, 'display_name', `${label}.entry`);
+    requireNumber(e, 'mana', `${label}.entry`);
+    requireNumber(e, 'owned_tile_count', `${label}.entry`);
   }
-  // An ISO-8601 string, and a real one: a mana bar that renders
-  // "Invalid Date" because this came back as a number is exactly the kind of
-  // silent mismatch these assertions exist to prevent.
-  const resetAt = requireString(obj, 'daily_reset_at', label);
-  if (Number.isNaN(Date.parse(resetAt))) {
-    throw new ShapeError(`${label}.daily_reset_at is not a parseable date: ${resetAt}`);
+
+  const viewer = requireField(obj, 'viewer', label);
+  if (viewer !== null) {
+    const v = requireObject(viewer, `${label}.viewer`);
+    requireNumber(v, 'user_id', `${label}.viewer`);
+    requireString(v, 'display_name', `${label}.viewer`);
+    requireNumber(v, 'mana', `${label}.viewer`);
+    requireNumber(v, 'owned_tile_count', `${label}.viewer`);
+    requireNullableNumber(v, 'rank', `${label}.viewer`);
   }
 }

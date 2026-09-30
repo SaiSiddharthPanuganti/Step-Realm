@@ -11,14 +11,19 @@ Design rules
   when the gain is entirely absorbed by the cap.
 * **Postgres is the only authority.** Nothing here caches mana anywhere else.
 
+The faucet
+----------
+The only active mana faucet is walking distance. :func:`record_walk
+<app.services.walk_service.record_walk>` owns its transaction and takes a row
+lock, and folds mana settlement into the same transaction that validates and
+ledgers the walk, so the metres that buy a claim are the metres the server
+itself measured -- the client's only input is a raw GPS distance.
+
 Transaction ownership
 ---------------------
-:func:`sync_mana` owns its transaction and takes a row lock, because two
-concurrent syncs reading the same ``pending_step_remainder`` and
-``daily_mana_earned`` would otherwise both grant mana for the same steps.
 :func:`settle_mana` deliberately does *not* commit, so a caller that already
-holds the lock (phase 5's claim transaction) can fold mana settlement into the
-same transaction as the tile write.
+holds the lock (a walk report, or phase 5's claim transaction) can fold mana
+settlement into the same transaction as the write it is already doing.
 """
 
 from __future__ import annotations
@@ -31,14 +36,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
 from app.core.constants import (
     DAILY_WALKING_MANA_CAP,
     MANA_MAX,
-    MANA_PER_STEP_BLOCK,
+    MANA_PER_METER,
     MANA_REGEN_AMOUNT,
     MANA_REGEN_PERIOD_MINUTES,
-    STEPS_PER_MANA_BLOCK,
 )
 from app.models.user import User
 
@@ -49,44 +52,6 @@ REGEN_PERIOD = timedelta(minutes=MANA_REGEN_PERIOD_MINUTES)
 
 class UserNotFound(Exception):
     """The user vanished between authentication and the locked read."""
-
-
-class ImplausibleStepCount(Exception):
-    """A step delta no real walking could have covered in the elapsed time.
-
-    Carries the numbers so the API can tell the player what was plausible rather
-    than refusing without explanation.
-    """
-
-    def __init__(self, steps: int, max_plausible: int) -> None:
-        super().__init__(
-            f"{steps} steps is not plausible; at most {max_plausible} could have "
-            "been walked since your last sync"
-        )
-        self.steps = steps
-        self.max_plausible = max_plausible
-
-
-#: Floor on the elapsed time used for the speed check, in seconds.
-#:
-#: Without it, two syncs arriving microseconds apart measure against a
-#: near-zero window and an allowance of essentially zero steps, so a player who
-#: foregrounds the app and syncs immediately gets rejected for a walk that
-#: really happened. One second is the smallest honest unit here: it admits a
-#: handful of steps twice in a row and still refuses a tight loop submitting
-#: thousands.
-_MIN_ELAPSED_SECONDS = 1.0
-
-#: How much walking a player who has never synced steps is assumed to have done.
-#:
-#: A deliberate hole, and the same trade as ``INITIAL_MANA``: a brand new
-#: account is measured from ``created_at`` rather than treated as unlimited, and
-#: without this the first sync of a real player's first session would be measured
-#: against the seconds since they tapped "sign up" and rejected. Ten minutes buys
-#: 3,000 steps at the cap -- a full mana block and some change -- so the
-#: concession is small, and it is granted exactly once, at account creation,
-#: rather than being a standing allowance.
-_FIRST_SYNC_GRACE_SECONDS = 600.0
 
 
 @dataclass(frozen=True)
@@ -100,14 +65,15 @@ class ManaOutcome:
 
     passive_gained: int
     walking_gained: int
-    steps_credited: int
-    """Steps actually absorbed. Equal to the submitted delta, unless the
-    daily cap left no room for the resulting blocks."""
+    walk_meters_credited: float
+    """The distance this settlement priced. Equal to the metres the caller
+    validated, whatever the cap did to the resulting mana."""
 
     mana_forfeited_to_daily_cap: int
     """Mana lost because the player had already hit
-    ``DAILY_WALKING_MANA_CAP`` today. Whole blocks only -- a partial block
-    is always carried forward, never forfeited."""
+    ``DAILY_WALKING_MANA_CAP`` today. Whole mana only -- any sub-mana metre
+    fraction vanishes on the floor, which at 1 mana per metre is at most half
+    a mana per report."""
 
     mana_forfeited_to_mana_max: int
     """Mana earned but absorbed by ``MANA_MAX`` because the bar was already
@@ -219,99 +185,46 @@ def apply_passive_regen(user: User, now: datetime) -> int:
     return gained
 
 
-def apply_walking_steps(
-    user: User, steps: int, now: datetime
+def apply_walking_metres(
+    user: User, metres: float, now: datetime
 ) -> tuple[int, int, int]:
-    """Credit a step delta.
+    """Credit validated walking distance.
 
     Returns ``(mana_gained, forfeited_to_daily_cap, forfeited_to_mana_max)``.
 
-    Fractional blocks carry forward via ``pending_step_remainder``; whole
-    blocks that the daily cap cannot accommodate are dropped, because
-    carrying them would let a player bank a buffer and spend it all at once on
-    a later day.
-    """
-    if steps < 0:
-        raise ValueError("step delta must be non-negative")
+    Distance earns ``MANA_PER_METER`` mana per metre, truncated to whole mana
+    per report (at 1:1 the fractional loss is at most one mana). Over a day the
+    ``MANA_MAX`` bar is filled before the daily cap, and the order they bite in
+    matters:
 
-    total_steps = user.pending_step_remainder + steps
-    whole_blocks = total_steps // STEPS_PER_MANA_BLOCK
-    user.pending_step_remainder = total_steps % STEPS_PER_MANA_BLOCK
+    * Distance that the daily cap cannot accommodate is dropped, because
+      carrying it would let a player bank a buffer and spend it all at once on
+      a later day.
+    * A ``walk_meters`` value is never refundable: the ledger records what was
+      walked, the client reports a distance, and there is no step count for a
+      malicious client to inflate.
+    """
+    if metres < 0:
+        raise ValueError("walk distance must be non-negative")
+
+    earned = int(metres * MANA_PER_METER)
 
     headroom = DAILY_WALKING_MANA_CAP - user.daily_mana_earned
-    granted_blocks = min(whole_blocks, max(headroom, 0) // MANA_PER_STEP_BLOCK)
-    forfeited_to_cap = (whole_blocks - granted_blocks) * MANA_PER_STEP_BLOCK
-    mana_gained = granted_blocks * MANA_PER_STEP_BLOCK
+    granted = min(earned, max(headroom, 0))
+    forfeited_to_cap = earned - granted
 
-    # Count what was *earned* against the daily cap, not what fitted in the
-    # bar. If the cap only counted mana that actually landed, a player sitting
-    # at MANA_MAX could earn a further 200 mana into a full bar and then have
-    # a full bar the instant they spent 20 on a tile -- a straight bypass of
-    # the daily limit.
-    user.daily_mana_earned += mana_gained
+    # Count what was *earned* toward the daily cap, not what fitted in the bar.
+    # If the cap only counted mana that actually landed, a player sitting at
+    # MANA_MAX could earn a further 2000 mana into a full bar and then have a
+    # full bar the instant they spent 20 on a tile -- a straight bypass of the
+    # daily limit.
+    user.daily_mana_earned += granted
 
     before = user.mana
-    user.mana = min(user.mana + mana_gained, MANA_MAX)
-    forfeited_to_max = mana_gained - (user.mana - before)
+    user.mana = min(user.mana + granted, MANA_MAX)
+    forfeited_to_max = granted - (user.mana - before)
 
-    return mana_gained, forfeited_to_cap, forfeited_to_max
-
-
-def step_allowance(user: User, now: datetime) -> int:
-    """How many steps could plausibly have been walked since the last sync.
-
-    ``MAX_STEPS_PER_SYNC`` bounds a single request but cannot tell a legitimate
-    afternoon's walk from a scripted one, because the same 250,000 is fine once
-    an hour and absurd ten times a minute. Only the ratio to elapsed time
-    separates those, and the elapsed time is entirely server-side: the baseline
-    is a column this service writes, never a timestamp from the request.
-
-    ``created_at`` is NOT NULL and ``last_step_sync_at`` is nullable, so
-    ``last_step_sync_at or created_at`` is always a datetime. There is no
-    "no baseline" case to handle, and inventing one would only add a path that
-    can never be exercised.
-    """
-    settings = get_settings()
-    baseline = user.last_step_sync_at or user.created_at
-
-    elapsed = (now - baseline).total_seconds()
-    if user.last_step_sync_at is None:
-        # First sync. The account's own age is the honest baseline, but a player
-        # who signs up and immediately syncs a walk has seconds of elapsed time
-        # and a real delta, so the floor grants a grace period rather than
-        # refusing them.
-        elapsed = max(elapsed, _FIRST_SYNC_GRACE_SECONDS)
-    elapsed = max(elapsed, _MIN_ELAPSED_SECONDS)
-
-    return int(elapsed * settings.max_steps_per_second)
-
-
-def check_step_plausibility(
-    user: User, steps: int, *, now: datetime | None = None
-) -> None:
-    """Raise :class:`ImplausibleStepCount` if ``steps`` could not have been walked.
-
-    Not a security control -- a client that walks honestly could still lie about
-    how far. It makes the blatant version fail loudly instead of paying out, and
-    it is the first rule in the codebase that reasons about a step count being
-    *impossible* rather than merely *large*.
-    """
-    if steps <= 0:
-        return
-    now = ensure_utc(now) if now is not None else utcnow()
-    max_plausible = step_allowance(user, now)
-    if steps > max_plausible:
-        raise ImplausibleStepCount(steps, max_plausible)
-
-
-def advance_step_baseline(user: User, now: datetime) -> None:
-    """Record that steps were just credited, starting the next allowance window.
-
-    Called only on the success path, and only when ``steps`` was non-zero -- see
-    the note on ``User.last_step_sync_at`` for why a rejected or zero-step sync
-    must leave the baseline alone.
-    """
-    user.last_step_sync_at = now
+    return granted, forfeited_to_cap, forfeited_to_max
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +233,7 @@ def advance_step_baseline(user: User, now: datetime) -> None:
 
 
 def settle_mana(
-    user: User, *, steps: int = 0, now: datetime | None = None
+    user: User, *, walk_meters: float = 0.0, now: datetime | None = None
 ) -> ManaOutcome:
     """Bring one user up to date. Mutates ``user``; does **not** commit.
 
@@ -334,14 +247,14 @@ def settle_mana(
 
     reset_performed = roll_daily_reset(user, now)
     passive_gained = apply_passive_regen(user, now)
-    walking_gained, forfeited_cap, forfeited_max = apply_walking_steps(
-        user, steps, now
+    walking_gained, forfeited_cap, forfeited_max = apply_walking_metres(
+        user, walk_meters, now
     )
 
     return ManaOutcome(
         passive_gained=passive_gained,
         walking_gained=walking_gained,
-        steps_credited=steps,
+        walk_meters_credited=walk_meters,
         mana_forfeited_to_daily_cap=forfeited_cap,
         mana_forfeited_to_mana_max=forfeited_max,
         daily_reset_performed=reset_performed,
@@ -378,31 +291,6 @@ def load_user_for_update(session: Session, user_id: int) -> User:
         raise UserNotFound(user_id) from exc
 
 
-def sync_mana(
-    session: Session, user_id: int, steps: int, *, now: datetime | None = None
-) -> tuple[User, ManaOutcome]:
-    """Settle mana and credit steps in one locked transaction. Commits.
-
-    This is the only correct way to apply a step delta. Two concurrent syncs
-    without the lock would read the same remainder and daily counters and both
-    grant mana for the same steps.
-
-    The plausibility check runs under the same lock and before anything is
-    mutated, so a rejected sync leaves no trace: not the step remainder, not the
-    mana, and not the speed baseline. The last of those matters most -- a
-    rejection that advanced the baseline would shrink the player's allowance
-    every time they tripped it.
-    """
-    now = ensure_utc(now) if now is not None else utcnow()
-    locked = load_user_for_update(session, user_id)
-    check_step_plausibility(locked, steps, now=now)
-    outcome = settle_mana(locked, steps=steps, now=now)
-    if steps > 0:
-        advance_step_baseline(locked, now)
-    session.commit()
-    return locked, outcome
-
-
 def refresh_mana(
     session: Session, user: User, *, now: datetime | None = None
 ) -> tuple[User, ManaOutcome]:
@@ -410,14 +298,14 @@ def refresh_mana(
 
     This makes GET /me a writer, which deserves justification: a read that
     does not settle mana would show a stale balance, and worse, an unlocked
-    read racing a /mana/sync could overwrite the sync's result with a stale
-    value -- a genuine lost update. Taking the same row lock as the sync
+    read racing a walk report could overwrite the report's result with a stale
+    value -- a genuine lost update. Taking the same row lock as the walk
     serialises them.
 
     The cost is that every profile view serialises per user, which is
     negligible at one request per app foreground.
     """
     locked = load_user_for_update(session, user.id)
-    outcome = settle_mana(locked, steps=0, now=now)
+    outcome = settle_mana(locked, walk_meters=0.0, now=now)
     session.commit()
     return locked, outcome

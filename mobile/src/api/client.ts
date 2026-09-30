@@ -54,7 +54,7 @@ export interface ApiClientOptions {
 }
 
 export interface RequestOptions {
-  method?: 'GET' | 'POST';
+  method?: 'GET' | 'POST' | 'PATCH';
   body?: unknown;
   /** Skip the Authorization header, even when a token is available. */
   anonymous?: boolean;
@@ -231,6 +231,10 @@ export class ApiClient {
 
   post<T>(path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
     return this.request<T>(path, { ...options, method: 'POST', body });
+  }
+
+  patch<T>(path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
+    return this.request<T>(path, { ...options, method: 'PATCH', body });
   }
 }
 

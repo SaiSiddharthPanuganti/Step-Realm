@@ -507,3 +507,63 @@ def test_display_name_is_not_nullable() -> None:
                 )
             )
         session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# PATCH /me/display-name
+# ---------------------------------------------------------------------------
+
+
+def _rename(client, headers, name) -> dict:
+    response = client.patch(
+        "/me/display-name", json={"display_name": name}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_rename_changes_the_profile(client, auth_headers) -> None:
+    body = _rename(client, auth_headers(), "TheFirstWalker")
+
+    assert body["display_name"] == "TheFirstWalker"
+    assert body["id"] is not None
+    assert body["mana_max"] == 200
+
+
+def test_rename_strips_surrounding_whitespace(client, auth_headers) -> None:
+    body = _rename(client, auth_headers(), "  spacer  ")
+    assert body["display_name"] == "spacer"
+
+
+def test_rename_rejects_invalid_characters(client, auth_headers) -> None:
+    headers = auth_headers()
+    response = client.patch(
+        "/me/display-name", json={"display_name": "bad name!"}, headers=headers
+    )
+    assert response.status_code == 422
+
+
+def test_rename_rejects_out_of_range_length(client, auth_headers) -> None:
+    headers = auth_headers()
+    response = client.patch(
+        "/me/display-name", json={"display_name": "ab"}, headers=headers
+    )
+    assert response.status_code == 422
+
+
+def test_rename_conflict_is_409(client, make_user) -> None:
+    """Uniqueness is case-insensitive, so taking the case-variant of a name
+    another player holds must collide -- the signup rule, applied to renames."""
+
+    from app.core.security import create_access_token
+
+    make_user(email="holder@x.com", display_name="Reserved")
+    renamer_id = make_user()
+    token, _ = create_access_token(renamer_id)
+
+    response = client.patch(
+        "/me/display-name",
+        json={"display_name": "reserved"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 409, response.text

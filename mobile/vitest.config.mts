@@ -26,6 +26,9 @@ export default defineConfig({
           environment: 'node',
           include: ['tests/*.contract.test.ts'],
           globalSetup: ['./tests/helpers/server.ts'],
+          // Headroom over vitest's default so geometry tests that loop several
+          // live-server round trips on a slow CI box do not trip the clock.
+          testTimeout: 30000,
         },
       },
     ],

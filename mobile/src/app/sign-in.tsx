@@ -41,11 +41,12 @@ export default function SignInScreen() {
     const ok = mode === 'sign-in'
       ? await signIn(credentials)
       : await signUp(credentials);
-    // The session store is the source of truth and `index` redirects on it, so
-    // navigating from here as well would race that redirect. This replace keeps
-    // the sign-in screen out of the back stack once there is a session.
+    // The session store is the source of truth and `index` redirects on it --
+    // a fresh signup goes to the naming gate, a returning player to the map --
+    // so navigating from here as well would race that redirect. This replace
+    // keeps the sign-in screen out of the back stack once there is a session.
     if (ok) {
-      router.replace('/map');
+      router.replace('/');
     }
   }
 

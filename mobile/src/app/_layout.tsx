@@ -62,7 +62,10 @@ export default function RootLayout() {
           >
             <Stack.Screen name="index" />
             <Stack.Screen name="sign-in" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="display-name" />
             <Stack.Screen name="map" />
+            <Stack.Screen name="profile" />
+            <Stack.Screen name="leaderboard" />
           </Stack>
         )}
       </SafeAreaProvider>

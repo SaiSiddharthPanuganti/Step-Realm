@@ -26,8 +26,17 @@ from app.schemas.territory import (
     ClaimRequest,
     ClaimResponse,
     ClaimedTile,
+    WalkReportRequest,
+    WalkReportResponse,
 )
-from app.services import rate_limit_service, territory_service
+from app.services import (
+    leaderboard_service,
+    rate_limit_service,
+    territory_service,
+    walk_service,
+    walkability_service,
+)
+from app.services.geo import lonlat_to_axial
 from app.services.mana_service import UserNotFound
 
 logger = logging.getLogger(__name__)
@@ -67,6 +76,28 @@ def _build_response(outcome: territory_service.ClaimOutcome) -> ClaimResponse:
     )
 
 
+def _ensure_walkable(q: int, r: int) -> None:
+    """Refuse to materialise a hex that is not on walkable ground.
+
+    Runs *before* ``claim_tile`` so the Overpass fetch never happens inside the
+    claim's locked transaction (a network call holding a user row lock would
+    serialise every other claim behind it) and so a refusal costs nothing.
+
+    Degrades to allowing the claim when the data source is down, matching the
+    map view's fail-open: during an outage the grid shows everywhere and
+    anywhere is claimable, which is at least a coherent world.
+    """
+    if not get_settings().walkability_enabled:
+        return
+    try:
+        walkable = walkability_service.walkability_for_claim(q, r)
+    except walkability_service.WalkabilityUnavailable as exc:
+        logger.warning("walkability unavailable; claim not restricted: %s", exc)
+        return
+    if not walkable:
+        raise territory_service.NotWalkable
+
+
 def _translate(exc: Exception) -> HTTPException:
     """Map a domain error to the status a client can act on."""
     if isinstance(exc, territory_service.TileAlreadyClaimed):
@@ -90,10 +121,28 @@ def _translate(exc: Exception) -> HTTPException:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Claim a tile adjacent to territory you already own",
         )
+    if isinstance(exc, territory_service.NotWalkable):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Hexes only appear where ground is walkable -- move to a road or path",
+        )
     if isinstance(exc, territory_service.OutsideWorldLeash):
         return HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="That tile is outside the playable world",
+        )
+    if isinstance(exc, territory_service.NotEnoughWalkProgress):
+        # 422 like its siblings: structurally valid, but the player has not yet
+        # earned the right. The message carries how far off they are, and the
+        # status lets a client branch on "keep walking" rather than treating it
+        # as a failure.
+        delta = exc.required - exc.walked
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Walk {exc.required:.0f} m inside this hex to claim it"
+                f" -- {max(0, delta):.0f} m to go"
+            ),
         )
     if isinstance(exc, UserNotFound):
         # Authenticated a moment ago, deleted since. Same generic 401 as any
@@ -124,6 +173,7 @@ def claim(
     rival".
     """
     try:
+        _ensure_walkable(payload.q, payload.r)
         outcome = territory_service.claim_tile(
             session, user_id=user.id, q=payload.q, r=payload.r
         )
@@ -131,6 +181,8 @@ def claim(
         territory_service.TileAlreadyClaimed,
         territory_service.InsufficientMana,
         territory_service.NotAdjacentToTerritory,
+        territory_service.NotWalkable,
+        territory_service.NotEnoughWalkProgress,
         territory_service.OutsideWorldLeash,
         UserNotFound,
     ) as exc:
@@ -145,7 +197,11 @@ def claim(
             },
         )
 
-    return _build_response(outcome)
+    response = _build_response(outcome)
+    # Best-effort: the leaderboard's sorted set is a cache, so a dropped write
+    # only makes this entry stale until the next read repairs it.
+    leaderboard_service.sync_tile_count(user.id, outcome.owned_tile_count)
+    return response
 
 
 @router.post(
@@ -170,7 +226,9 @@ def claim_by_location(
     and the world it can reach is the world it already owns. This endpoint takes
     an arbitrary coordinate, which makes it the cheap way to enumerate the map.
     """
+    q, r = lonlat_to_axial(payload.lat, payload.lon)
     try:
+        _ensure_walkable(q, r)
         outcome = territory_service.claim_tile_at_location(
             session, user_id=user.id, lat=payload.lat, lon=payload.lon
         )
@@ -178,9 +236,75 @@ def claim_by_location(
         territory_service.TileAlreadyClaimed,
         territory_service.InsufficientMana,
         territory_service.NotAdjacentToTerritory,
+        territory_service.NotWalkable,
+        territory_service.NotEnoughWalkProgress,
         territory_service.OutsideWorldLeash,
         UserNotFound,
     ) as exc:
         raise _translate(exc) from None
 
-    return _build_response(outcome)
+    response = _build_response(outcome)
+    # Same best-effort cache write as the plain claim endpoint.
+    leaderboard_service.sync_tile_count(user.id, outcome.owned_tile_count)
+    return response
+
+
+@router.post(
+    "/walk",
+    response_model=WalkReportResponse,
+    summary="Report metres walked inside a hex",
+)
+def report_walk(
+    payload: WalkReportRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+) -> WalkReportResponse:
+    """Credit ``payload.meters`` walked towards the hex containing (lat, lon).
+
+    This is how the 20-metre claim rule stays server-owned, and it is now also
+    how mana is earned. The client measures how far it has walked (GPS
+    displacement) and reports the delta; the server validates it, credits the
+    metres to a per-hex ledger *and* converts them to mana at
+    ``MANA_PER_METER``. The response carries both, so the player sees distance
+    progress toward their claim and the mana it just banked in one round trip.
+
+    Rejected deltas (bigger than any real walk since the previous report, or a
+    single report over the per-report ceiling) come back as 422 with the
+    plausible figure, and leave the ledger, the balance and the baseline
+    untouched -- a rejected report must not shrink the next one.
+    """
+    try:
+        result = walk_service.record_walk(
+            session,
+            user_id=user.id,
+            lat=payload.lat,
+            lon=payload.lon,
+            meters=payload.meters,
+        )
+    except walk_service.ImplausibleWalkReport as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from None
+    except UserNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+
+    required = get_settings().min_claim_distance_meters
+    return WalkReportResponse(
+        q=result.q,
+        r=result.r,
+        total=round(result.total, 1),
+        required=required,
+        remaining=max(0.0, round(required - result.total, 1)),
+        mana=result.mana,
+        mana_max=result.mana_max,
+        walking_gained=result.walking_gained,
+        passive_gained=result.passive_gained,
+        total_mana_gained=result.walking_gained + result.passive_gained,
+        daily_mana_earned=result.daily_mana_earned,
+        daily_mana_remaining=result.daily_mana_remaining,
+    )

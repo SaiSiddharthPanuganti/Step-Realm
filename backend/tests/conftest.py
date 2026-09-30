@@ -37,6 +37,16 @@ os.environ["REDIS_URL"] = os.environ.get("TEST_REDIS_URL", "redis://localhost:63
 # bcrypt cost 12 is ~250 ms per hash. The suite creates dozens of accounts,
 # so drop it to the minimum; correctness of the *scheme* is unaffected.
 os.environ["BCRYPT_ROUNDS"] = "4"
+# Walkability is off unless a test turns it on. Never discovered from a
+# developer's .env: a world fetch that silently dials out to Overpass -- or
+# worse, hangs on a public service -- would make the suite flaky on a machine
+# without network, and the tests that do exercise it stub the fetch anyway.
+os.environ["WALKABILITY_ENABLED"] = "false"
+# The claim-distance gate is a walk-free flow for almost every existing test:
+# a suite that had to physically report GPS distance before each claim would
+# measure the gate instead of the claims it was written for. The gate has its
+# own dedicated tests, which turn it back on via settings_override.
+os.environ["MIN_CLAIM_DISTANCE_METERS"] = "0"
 
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
@@ -93,11 +103,20 @@ def _clean_tables() -> Iterator[None]:
     with get_session_factory()() as session:
         session.execute(
             text(
-                "TRUNCATE hex_tiles, users, colleges, rate_limit_counters "
-                "RESTART IDENTITY CASCADE"
+                "TRUNCATE hex_tiles, walk_progress, users, colleges, "
+                "rate_limit_counters RESTART IDENTITY CASCADE"
             )
         )
         session.commit()
+
+    # Redis is a derived cache, so its sorted set would otherwise carry the
+    # previous test's user_id/score members into this one (member ids restart
+    # identity, so a stale member is worse than useless). Best effort, exactly
+    # as at runtime: a Redis that cannot answer leaves the set alone and the
+    # next read rebuilds it from Postgres.
+    from app.services import leaderboard_service
+
+    leaderboard_service.reset_leaderboard()
 
     yield
 
@@ -231,8 +250,7 @@ def _user_state(user_id: int) -> dict:
         row = read_session.execute(
             sql_text(
                 "SELECT mana, last_mana_regen_at, daily_mana_earned, "
-                "daily_mana_reset_at, pending_step_remainder, "
-                "created_at, last_step_sync_at "
+                "daily_mana_reset_at, created_at, last_walk_report_at "
                 "FROM users WHERE id = :id"
             ),
             {"id": user_id},
@@ -264,7 +282,6 @@ def make_user() -> callable:
             "last_mana_regen_at": now,
             "daily_mana_earned": 0,
             "daily_mana_reset_at": mana_service.next_daily_reset(now),
-            "pending_step_remainder": 0,
         }
         data.update(overrides)
         with get_session_factory()() as write_session:
@@ -320,14 +337,15 @@ def age_user() -> callable:
 
 
 @pytest.fixture
-def age_step_sync() -> callable:
-    """Backdate a user's step-sync baseline by a timedelta.
+def age_walk_report() -> callable:
+    """Backdate a user's walk-report baseline by a timedelta.
 
-    The phase 6 walking-speed cap measures a step delta against the time since
-    the last *credited* sync, so any test that submits steps more than once has
-    to place that baseline in the past or the second submission is correctly
-    refused as implausible. Tests about mana accounting rather than about the cap
-    use this to get past it; the cap's own tests deliberately do not.
+    The plausibility check measures a reported distance against the time since
+    the last *credited* report, so any test that submits more than one report
+    has to place that baseline in the past or the second submission is
+    correctly refused as implausible. Tests about mana accounting rather than
+    about the cap use this to get past it; the cap's own tests (in
+    test_walk_progress.py) deliberately rely on the real baseline.
     """
     from datetime import timedelta
 
@@ -339,7 +357,7 @@ def age_step_sync() -> callable:
         with get_session_factory()() as write_session:
             write_session.execute(
                 sql_text(
-                    "UPDATE users SET last_step_sync_at = last_step_sync_at - "
+                    "UPDATE users SET last_walk_report_at = last_walk_report_at - "
                     "(:interval)::interval WHERE id = :id"
                 ),
                 {"interval": f"{int(by.total_seconds())} seconds", "id": user_id},
@@ -347,52 +365,3 @@ def age_step_sync() -> callable:
             write_session.commit()
 
     return _age
-
-
-@pytest.fixture
-def set_step_sync_baseline() -> callable:
-    """Place a user's step-sync baseline at an exact instant.
-
-    For the tests that need a precise allowance rather than a plausible one, so
-    the boundary between accepted and refused is exact instead of approximate.
-    """
-    from datetime import datetime
-
-    from sqlalchemy import text as sql_text
-
-    from app.db.session import get_session_factory
-
-    def _set(user_id: int, when: datetime) -> None:
-        with get_session_factory()() as write_session:
-            write_session.execute(
-                sql_text("UPDATE users SET last_step_sync_at = :when WHERE id = :id"),
-                {"when": when, "id": user_id},
-            )
-            write_session.commit()
-
-    return _set
-
-
-@pytest.fixture
-def no_step_speed_cap(monkeypatch) -> None:
-    """Make the walking-speed allowance irrelevant to a test.
-
-    Several pre-phase-6 mana tests exist to pin down *accounting* -- remainder
-    carry-forward, partial blocks, concurrent credit -- and they submit a whole
-    block's worth of steps because that is the size of a block. With the speed
-    cap live, a second submission in the same instant is legitimately refused,
-    so those tests would measure the cap instead of the accounting they were
-    written for, and the tempting fix would be to weaken the cap to suit them.
-
-    This stubs ``step_allowance`` rather than the ``max_steps_per_second``
-    setting. The setting is capped at 50 steps/second in ``Settings`` on purpose,
-    which is the right guard for production, and 50 is still not enough to make a
-    250,000-step block plausible inside a test. Stubbing the function states the
-    intent directly -- "this test is not about walking speed" -- while the cap
-    keeps its own dedicated tests against the real calculation.
-    """
-    from app.services import mana_service
-
-    monkeypatch.setattr(
-        mana_service, "step_allowance", lambda user, now: 10**9
-    )

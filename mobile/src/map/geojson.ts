@@ -66,6 +66,112 @@ export function lonLatToWorld(lon: number, lat: number): [number, number] {
   return [x, y];
 }
 
+const SQRT3 = Math.sqrt(3);
+
+/** Axial coordinate of a hex, as the server sends it. */
+export interface Axial {
+  q: number;
+  r: number;
+}
+
+/** Axial to plane metres, pointy-top. The exact inverse of the server's. */
+export function axialToWorld(q: number, r: number, circumradiusMeters: number): [number, number] {
+  const x = circumradiusMeters * (SQRT3 * q + (SQRT3 / 2) * r);
+  const y = circumradiusMeters * 1.5 * r;
+  return [x, y];
+}
+
+/** Axial to WGS84 centre. The server's `axial_to_lonlat`. */
+export function axialToLonLat(q: number, r: number, circumradiusMeters: number): LonLat {
+  const [x, y] = axialToWorld(q, r, circumradiusMeters);
+  return worldToLonLat(x, y);
+}
+
+/** Fold a longitude into `[-180, 180)`, matching the server's normalisation. */
+function normaliseLongitude(lon: number): number {
+  return (((lon + 180) % 360) + 360) % 360 - 180;
+}
+
+/**
+ * Snap a fractional axial coordinate to the nearest real hex.
+ *
+ * `floor(x + 0.5)` rather than rounding to nearest on each axis alone: on a
+ * cube (x + y + z = 0) the two axes are not independent, and rounding them
+ * separately can produce a pair that is not a hex at all. The port of
+ * `app.services.geo.cube_round`, including the `floor(+0.5)` convention that
+ * JS `Math.round` would quietly break (halves round to even there).
+ */
+function cubeRound(qFraction: number, rFraction: number): Axial {
+  const sFraction = -qFraction - rFraction;
+  let q = Math.floor(qFraction + 0.5);
+  let r = Math.floor(rFraction + 0.5);
+  const s = Math.floor(sFraction + 0.5);
+  const qError = Math.abs(q - qFraction);
+  const rError = Math.abs(r - rFraction);
+  const sError = Math.abs(s - sFraction);
+  if (qError > rError && qError > sError) {
+    q = -r - s;
+  } else if (rError > sError) {
+    r = -q - s;
+  }
+  // Clamp the float artefacts of the repair branch: `-0 - 0` is `-0`, and
+  // `-0` compares equal to `0` yet is a distinct value to `Object.is`, which
+  // is what a deep-equality assertion uses. A returned hex of "negative zero"
+  // trips that for a coordinate the caller cannot distinguish anyway.
+  return { q: q === 0 ? 0 : q, r: r === 0 ? 0 : r };
+}
+
+/**
+ * The full client-facing projection: a GPS fix to the tile containing it.
+ *
+ * Mirrors `app.services.geo.lonlat_to_axial` exactly, including the
+ * longitude normalisation and the Mercator latitude clamp. This is the one
+ * piece of projection math the client must reproduce, because walk metres are
+ * attributed to the hex the *server* will later project the same coordinate
+ * into -- the two implementations agreeing is the whole point of having both.
+ */
+export function lonlatToAxial(lon: number, lat: number, circumradiusMeters: number): Axial {
+  const x = WEB_MERCATOR_RADIUS_METERS * normaliseLongitude(lon) * DEG_TO_RAD;
+  const clamped = Math.max(-MAX_MERCATOR_LATITUDE, Math.min(MAX_MERCATOR_LATITUDE, lat));
+  const y =
+    WEB_MERCATOR_RADIUS_METERS *
+    Math.log(Math.tan(Math.PI / 4 + (clamped * DEG_TO_RAD) / 2));
+  const qFraction = ((SQRT3 / 3) * x - (1 / 3) * y) / circumradiusMeters;
+  const rFraction = ((2 / 3) * y) / circumradiusMeters;
+  return cubeRound(qFraction, rFraction);
+}
+
+/** Ground distance between two WGS84 points, in metres (great-circle). */
+export function haversineMeters(a: LonLat, b: LonLat): number {
+  // Mean Earth radius, a compromise constant that keeps a "40 m hex" honest
+  // to within the metre or two that GPS accuracy dwarfs anyway.
+  const EARTH_RADIUS_METERS = 6_371_008.8;
+  const lat1 = a[1] * DEG_TO_RAD;
+  const lat2 = b[1] * DEG_TO_RAD;
+  const dLat = (b[1] - a[1]) * DEG_TO_RAD;
+  const dLon = (b[0] - a[0]) * DEG_TO_RAD;
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * EARTH_RADIUS_METERS * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/**
+ * Initial bearing from one point to the next, degrees clockwise from north.
+ *
+ * The direction of travel when a fix has no compass heading of its own
+ * (cheap GPS chips report a heading only while moving). Same convention as
+ * `coords.heading`: 0 = north, 90 = east, and the map's direction cone
+ * rotates by exactly this number.
+ */
+export function bearingDegrees(a: LonLat, b: LonLat): number {
+  const lat1 = a[1] * DEG_TO_RAD;
+  const lat2 = b[1] * DEG_TO_RAD;
+  const dLon = (b[0] - a[0]) * DEG_TO_RAD;
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  return (Math.atan2(y, x) * RAD_TO_DEG + 360) % 360;
+}
+
 /**
  * The six corners of a pointy-top hex, as a closed ring.
  *
@@ -98,6 +204,35 @@ export function hexRing(tile: WorldTile, circumradiusMeters: number): LonLat[] {
   return ring;
 }
 
+/**
+ * The closed corner ring of the hex at an arbitrary axial coordinate.
+ *
+ * What the map draws under the player while they walk: the ring of the hex
+ * they are *standing in*, which the world response does not include (that tile
+ * may be outside the requested viewport). Computed from the same
+ * axial-to-plane math the tiles themselves use, so the highlight cannot object
+ * to where an ownership polygon sits.
+ */
+export function hexRingAt(q: number, r: number, circumradiusMeters: number): LonLat[] {
+  const [centreX, centreY] = axialToWorld(q, r, circumradiusMeters);
+  const ring: LonLat[] = [];
+  for (let corner = 0; corner < 6; corner += 1) {
+    const angle = (30 + 60 * corner) * DEG_TO_RAD;
+    ring.push(
+      worldToLonLat(
+        centreX + circumradiusMeters * Math.cos(angle),
+        centreY + circumradiusMeters * Math.sin(angle),
+      ),
+    );
+  }
+  ring.push(ring[0]);
+  return ring;
+}
+
+/**
+ * The hexes that begin labelled, and every hex after the first needs one of
+ * these. Shared between the layer builder and the ownership predicate.
+ */
 export type TileOwnership = 'own' | 'rival' | 'unclaimed';
 
 /**

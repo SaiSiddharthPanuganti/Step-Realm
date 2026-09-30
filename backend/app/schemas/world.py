@@ -13,6 +13,7 @@ from dataclasses import asdict
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.config import get_settings
 from app.core.constants import HEX_SIZE_METERS
 from app.services.world_service import WorldViewport
 
@@ -60,6 +61,12 @@ class WorldTile(BaseModel):
     by default, so anything it returns goes to anyone who loads a map.
     ``display_name`` is the only identifying field, which is exactly why
     ``users.display_name`` had to exist before Phase 4 could be useful."""
+
+    walk_meters: float = 0.0
+    """How far the *viewer* has walked inside this hex. Zeros for anonymous
+    viewport fetches and for every tile a different player walked in -- it is
+    only meaningful against ``viewer_id``. Drives the "X of 20 m walked" UI and
+    is what the claim gate actually reads."""
 
 
 class WorldCentre(BaseModel):
@@ -111,6 +118,17 @@ class WorldResponse(BaseModel):
     ``null`` for an anonymous request."""
 
     latitude_was_clamped: bool
+    walkability_degraded: bool = False
+    """True when walkability is enabled but the data source was unreachable, so
+    the viewport was served *unfiltered*: the field spell into the map. The
+    client shows this as "whole grid, walkability check offline" rather than
+    silently implying every open field is claimable."""
+    claim_required_meters: float = Field(
+        default_factory=lambda: get_settings().min_claim_distance_meters
+    )
+    """The distance a player must cover inside a hex before claiming it, read
+    live from settings so client-rendered progress cannot drift from the number
+    the server actually enforces. ``0`` means claim-on-entry (tests, demos)."""
     bounds: WorldBounds
     tiles: list[WorldTile]
 
@@ -133,6 +151,7 @@ class WorldResponse(BaseModel):
             hex_size_meters=viewport.hex_size_meters,
             viewer_id=viewer_id,
             latitude_was_clamped=viewport.latitude_was_clamped,
+            walkability_degraded=viewport.walkability_degraded,
             # asdict, not vars: BoundingBox is a slots dataclass and so has no
             # __dict__ for vars() to read.
             bounds=WorldBounds(**asdict(viewport.bounds)),
@@ -149,6 +168,7 @@ class WorldResponse(BaseModel):
                         if tile.owner_id is not None
                         else None
                     ),
+                    walk_meters=round(tile.walk_meters, 1),
                 )
                 for tile in viewport.tiles
             ],
